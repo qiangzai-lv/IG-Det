@@ -221,8 +221,6 @@ class MultiViewScanNetDataset(Det3DDataset):
             self._2d_annotation_index = None
         else:
             annotation_path = Path(ann_file_2d)
-            if not annotation_path.is_absolute():
-                annotation_path = Path(data_root) / annotation_path
             self._2d_annotation_index = load_scannet_2d_annotation_index(
                 annotation_path, data_root)
 

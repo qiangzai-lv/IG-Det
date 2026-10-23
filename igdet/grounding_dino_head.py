@@ -15,7 +15,7 @@ from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_overlaps
 from mmdet.utils import reduce_mean
 from mmengine.structures import InstanceData
 
-from recondet.camera_alignment import unproject_query_depth
+from igdet.camera_alignment import unproject_query_depth
 
 
 CONFIDENT_QUERY_DEPTH_DEFAULTS = dict(
@@ -586,7 +586,7 @@ class GroundingDINOQueryDepthHead(nn.Module):
 
 
 @MODELS.register_module()
-class ReconGroundingDINOHead(GroundingDINOHead):
+class IGGroundingDINOHead(GroundingDINOHead):
 
     def __init__(self, contrastive_cfg=dict(max_text_len=256), **kwargs):
         self.supervise_2d_bbox = bool(kwargs.pop(

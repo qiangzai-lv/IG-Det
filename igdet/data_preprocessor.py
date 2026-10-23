@@ -17,7 +17,7 @@ from mmdet3d.registry import MODELS
 
 
 @MODELS.register_module()
-class ReconDetDataPreprocessor(DetDataPreprocessor):
+class IGDetDataPreprocessor(DetDataPreprocessor):
 
     VGGT_GT_INPUT_KEYS = (
         'gt_depths_vggt', 'gt_depth_valid_masks',
@@ -39,7 +39,7 @@ class ReconDetDataPreprocessor(DetDataPreprocessor):
                  boxtype2tensor: bool = True,
                  non_blocking: bool = False,
                  batch_augments: Optional[List[dict]] = None) -> None:
-        super(ReconDetDataPreprocessor, self).__init__(
+        super(IGDetDataPreprocessor, self).__init__(
             mean=mean,
             std=std,
             pad_size_divisor=pad_size_divisor,

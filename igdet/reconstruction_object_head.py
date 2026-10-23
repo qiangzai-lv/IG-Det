@@ -8,7 +8,7 @@ from mmdet.utils import reduce_mean
 from mmdet3d.registry import MODELS
 from torch import Tensor
 
-from recondet.camera_alignment import (
+from igdet.camera_alignment import (
     aligned_boxes_to_vggt, denormalize_vggt_boxes)
 from mmdet3d.structures.ops.iou3d_calculator import (
     axis_aligned_bbox_overlaps_3d)

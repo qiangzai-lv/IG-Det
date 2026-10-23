@@ -16,7 +16,7 @@ from mmdet.utils import register_all_modules
 
 
 def extract_grounding_dino_state_dict(state_dict):
-    """Extract Grounding DINO weights from native or full ReconDet checkpoints."""
+    """Extract Grounding DINO weights from native or full IGDet checkpoints."""
     cleaned = {
         name.removeprefix('module.'): value
         for name, value in state_dict.items()
@@ -318,7 +318,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 source_sample, 'gt_instances_2d', None)
             if source_instances_2d is None:
                 raise RuntimeError(
-                    'ReConDet training requires per-view gt_instances_2d')
+                    'IGDet training requires per-view gt_instances_2d')
             if len(source_instances_2d) != num_views:
                 raise ValueError(
                     'gt_instances_2d view count does not match input images: '

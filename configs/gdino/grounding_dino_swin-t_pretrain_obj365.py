@@ -3,15 +3,17 @@ _base_ = [
     '../_base_mmdet_/schedules/schedule_1x.py', '../_base_mmdet_/default_runtime.py'
 ]
 
-load_from = '/data/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
+custom_imports = dict(imports=['igdet'], allow_failed_imports=False)
 
-data_root = '/data/data/ScanNet_processed_v2/'
-scannet_ann_root = '/data/data/scannet_coco_v2/'
+load_from = 'data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
-lang_model_name = '/data/data/pretrain/bert-base-uncased'
+data_root = 'data/ScanNet_processed_v2/'
+scannet_ann_root = 'data/scannet_coco_v2/'
+
+lang_model_name = 'data/pretrain/bert-base-uncased'
 
 model = dict(
-    type='ReconGroundingDINO',
+    type='IGGroundingDINO',
     num_queries=64,
     freeze_modules=['language_model', 'backbone', 'neck', 'encoder'],
     with_box_refine=True,
@@ -106,7 +108,7 @@ model = dict(
     positional_encoding=dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
-        type='ReconGroundingDINOHead',
+        type='IGGroundingDINOHead',
         reconstruction_dims=512,
         log_depth_range=(-6.0, 6.0),
         reconstruction_depth_loss_weight=1.0,
