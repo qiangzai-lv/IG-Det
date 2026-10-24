@@ -10,6 +10,7 @@ from mmcv.utils import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 from torch.utils.checkpoint import checkpoint
 
 from mmdet.models.layers.transformer.utils import coordinate_to_encoding
+from igdet.instance_context import InstanceContext
 
 
 @torch.no_grad()
@@ -21,12 +22,6 @@ def compute_multiview_query_correspondence(instance_embeddings,
     summed within each target view. Pairwise query probabilities are not
     materialized, which keeps the persistent memory cost linear in Q.
     """
-    if instance_embeddings.ndim != 4:
-        raise ValueError(
-            'instance_embeddings must have shape [B, V, Q, C]')
-    if temperature <= 0:
-        raise ValueError('temperature must be positive')
-
     batch_size, num_views, num_queries, _ = instance_embeddings.shape
     top_indices = torch.zeros(
         (batch_size, num_views, num_queries, num_views),
@@ -57,15 +52,7 @@ def compute_multiview_query_correspondence(instance_embeddings,
 
 def gather_multiview_reference_points(reference_points, top_indices):
     """Gather the Top-1 target-view location for every source query."""
-    if reference_points.ndim != 4 or reference_points.shape[-1] != 2:
-        raise ValueError('reference_points must have shape [B, V, Q, 2]')
     batch_size, num_views, num_queries, _ = reference_points.shape
-    expected_shape = (batch_size, num_views, num_queries, num_views)
-    if top_indices.shape != expected_shape:
-        raise ValueError(
-            f'top_indices must have shape {expected_shape}, got '
-            f'{tuple(top_indices.shape)}')
-
     gathered = reference_points.new_zeros(
         batch_size, num_views, num_queries, num_views, 2)
     for target_view in range(num_views):
@@ -78,11 +65,6 @@ def gather_multiview_reference_points(reference_points, top_indices):
 
 def build_spatial_key_padding_mask(spatial_shapes, valid_ratios):
     """Build flattened per-level padding masks from valid image ratios."""
-    if spatial_shapes.ndim != 2 or spatial_shapes.shape[-1] != 2:
-        raise ValueError('spatial_shapes must have shape [L, 2]')
-    if (valid_ratios.ndim != 3 or valid_ratios.shape[1] != len(spatial_shapes)
-            or valid_ratios.shape[-1] != 2):
-        raise ValueError('valid_ratios must have shape [N, L, 2]')
 
     level_masks = []
     for level, (height, width) in enumerate(spatial_shapes.tolist()):
@@ -197,23 +179,12 @@ class ProjectedQueryDeformableAttention(nn.Module):
         attention = self.attention
         batch_size, num_value, _ = value.shape
         repeated_batch_size = batch_size * value_repeat
-        if projected_query.shape[0] != repeated_batch_size:
-            raise ValueError(
-                'projected query batch must equal value batch * value_repeat')
-        if ((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() !=
-                num_value):
-            raise ValueError('spatial shapes must cover the shared value')
-        if valid_ratios.shape[0] != batch_size:
-            raise ValueError('valid ratios must match the shared value batch')
-        if (key_padding_mask is not None and
-                key_padding_mask.shape != value.shape[:2]):
-            raise ValueError('key padding mask must match the shared value')
 
         repeated_ratios = valid_ratios.unsqueeze(1).expand(
             -1, value_repeat, -1, -1).reshape(
-                repeated_batch_size, self.num_levels, 2)
+            repeated_batch_size, self.num_levels, 2)
         scaled_reference_points = (
-            reference_points[:, :, None] * repeated_ratios[:, None])
+                reference_points[:, :, None] * repeated_ratios[:, None])
         projected_position = self.position_projection(query_pos)
         if output_dtype is None:
             output_dtype = projected_query.dtype
@@ -221,7 +192,7 @@ class ProjectedQueryDeformableAttention(nn.Module):
         with torch.autocast(
                 device_type=projected_query.device.type, enabled=False):
             attention_query = (
-                projected_query.float() + projected_position.float())
+                    projected_query.float() + projected_position.float())
             projected_value = attention.value_proj(value.float())
             if key_padding_mask is not None:
                 projected_value = projected_value.masked_fill(
@@ -233,12 +204,12 @@ class ProjectedQueryDeformableAttention(nn.Module):
             num_queries = attention_query.shape[1]
             sampling_offsets = attention.sampling_offsets(
                 attention_query).view(
-                    repeated_batch_size, num_queries, attention.num_heads,
-                    attention.num_levels, attention.num_points, 2)
+                repeated_batch_size, num_queries, attention.num_heads,
+                attention.num_levels, attention.num_points, 2)
             attention_weights = attention.attention_weights(
                 attention_query).view(
-                    repeated_batch_size, num_queries, attention.num_heads,
-                    attention.num_levels * attention.num_points)
+                repeated_batch_size, num_queries, attention.num_heads,
+                attention.num_levels * attention.num_points)
             attention_weights = attention_weights.softmax(-1).view(
                 repeated_batch_size, num_queries, attention.num_heads,
                 attention.num_levels, attention.num_points)
@@ -247,14 +218,14 @@ class ProjectedQueryDeformableAttention(nn.Module):
                 offset_normalizer = torch.stack(
                     [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
                 sampling_locations = (
-                    scaled_reference_points[:, :, None, :, None, :] +
-                    sampling_offsets /
-                    offset_normalizer[None, None, None, :, None, :])
+                        scaled_reference_points[:, :, None, :, None, :] +
+                        sampling_offsets /
+                        offset_normalizer[None, None, None, :, None, :])
             elif scaled_reference_points.shape[-1] == 4:
                 sampling_locations = (
-                    scaled_reference_points[:, :, None, :, None, :2] +
-                    sampling_offsets / attention.num_points *
-                    scaled_reference_points[:, :, None, :, None, 2:] * 0.5)
+                        scaled_reference_points[:, :, None, :, None, :2] +
+                        sampling_offsets / attention.num_points *
+                        scaled_reference_points[:, :, None, :, None, 2:] * 0.5)
             else:
                 raise ValueError(
                     'Last dim of reference_points must be 2 or 4, but got '
@@ -326,24 +297,14 @@ class GroundingDINO3DDecoderLayer(nn.Module):
         num_flat_views, num_queries, _ = query.shape
         if num_views <= 1:
             return torch.zeros_like(query)
-        if num_flat_views % num_views != 0:
-            raise ValueError('flattened views must be divisible by num_views')
         batch_size = num_flat_views // num_views
         expected_references = (
             batch_size, num_views, num_queries, num_views, 2)
-        expected_weights = expected_references[:-1]
-        if cross_reference_points.shape != expected_references:
-            raise ValueError(
-                'cross_reference_points must have shape '
-                f'{expected_references}')
-        if cross_view_weights.shape != expected_weights:
-            raise ValueError(
-                f'cross_view_weights must have shape {expected_weights}')
         expected_positions = expected_references[:-1] + (query.shape[-1],)
         if cross_query_positions is None:
             cross_query_positions = query_pos.reshape(
                 batch_size, num_views, num_queries, 1, -1).expand(
-                    expected_positions)
+                expected_positions)
         elif cross_query_positions.shape != expected_positions:
             raise ValueError(
                 f'cross_query_positions must have shape {expected_positions}')
@@ -391,7 +352,7 @@ class GroundingDINO3DDecoderLayer(nn.Module):
                 attended = attend_target_view(*attention_inputs)
             target_weights = cross_view_weights[
                 ..., target_view].reshape(
-                    num_flat_views, num_queries, 1).to(attended.dtype)
+                num_flat_views, num_queries, 1).to(attended.dtype)
             cross_view_output.add_(attended * target_weights)
         return cross_view_output
 
@@ -409,10 +370,6 @@ class GroundingDINO3DDecoderLayer(nn.Module):
             valid_ratios, key_padding_mask=spatial_key_padding_mask)
         query = query + self.dropout(spatial)
 
-        if ((cross_reference_points is None) !=
-                (cross_view_weights is None)):
-            raise ValueError(
-                'cross-view references and weights must be provided together')
         if cross_reference_points is not None and num_views > 1:
             cross_view = self._cross_view_forward(
                 query, query_pos, spatial_features, valid_ratios,
@@ -462,39 +419,23 @@ class GroundingDINO3DDecoder(nn.Module):
             layer.cross_view_attention.attention.init_weights()
 
     def initialize_query(self, semantic_query, reference_points):
-        if semantic_query.ndim != 3:
-            raise ValueError('semantic_query must have shape [N, Q, C]')
-        if semantic_query.shape[1] != self.num_queries:
-            raise ValueError(
-                'semantic query count must match reconstruction query count')
-        if reference_points.shape != semantic_query.shape[:2] + (2,):
-            raise ValueError(
-                'reference_points must have shape [N, Q, 2] matching query')
-        learned_query = self.query_embedding.weight[None].expand(
-            semantic_query.shape[0], -1, -1)
+        learned_query = self.query_embedding.weight[None].expand(semantic_query.shape[0], -1, -1)
         projected_semantic = self.semantic_query_projection(semantic_query)
         query = self.init_norm(learned_query + projected_semantic)
         return self.query_position_embedding(query, reference_points)
 
-    def forward(self, semantic_query, spatial_features, reference_points,
-                valid_ratios, instance_embeddings=None, num_views=1,
+    def forward(self, instance_context: InstanceContext, spatial_features,
+                valid_ratios,
                 correspondence_temperature=0.07):
-        if num_views <= 0:
-            raise ValueError('num_views must be positive')
-        if semantic_query.shape[0] % num_views != 0:
-            raise ValueError(
-                'semantic query batch must be divisible by num_views')
+        semantic_query = instance_context.queries
+        reference_points = instance_context.positions_2d
+        instance_embeddings = instance_context.instance_embeddings
+        num_views = instance_context.num_views
 
         cross_reference_points = None
         cross_view_weights = None
         cross_query_positions = None
         if num_views > 1:
-            if instance_embeddings is None:
-                raise ValueError(
-                    'instance_embeddings are required for multiview decoding')
-            if instance_embeddings.shape[:2] != semantic_query.shape[:2]:
-                raise ValueError(
-                    'instance_embeddings must begin with [B*V, Q]')
             batch_size = semantic_query.shape[0] // num_views
             embeddings_by_scene = instance_embeddings.reshape(
                 batch_size, num_views, self.num_queries, -1)
@@ -510,7 +451,7 @@ class GroundingDINO3DDecoder(nn.Module):
                 semantic_query.shape[0], self.num_queries * num_views, 2)
             cross_query_positions = self.reference_projection(
                 coordinate_to_encoding(flat_cross_references)).reshape(
-                    batch_size, num_views, self.num_queries, num_views, -1)
+                batch_size, num_views, self.num_queries, num_views, -1)
 
         query = self.initialize_query(semantic_query, reference_points)
         query_pos = self.reference_projection(
