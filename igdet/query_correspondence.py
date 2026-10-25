@@ -1,27 +1,29 @@
 import numpy as np
 import torch
-from mmcv.ops import boxes_iou3d
+from mmdet3d.structures.ops.iou3d_calculator import (
+    axis_aligned_bbox_overlaps_3d)
 
 
 @torch.no_grad()
 def _aligned_3d_nms(centers, sizes, scores, classes, threshold):
-    """Class-aware volume NMS using MMCV's CUDA 3D IoU operator.
+    """Class-aware volume NMS using device-native PyTorch AABB overlaps.
 
     Keep the legacy ascending-argsort/reverse traversal, including score ties.
     Compute IoUs in row chunks and perform greedy suppression on CPU masks,
-    avoiding a CUDA synchronization for every selected box. Only geometry and
+    avoiding a device synchronization for every selected box. Only geometry and
     indices participate; query features stay on their original device.
-    IoU numerics follow MMCV, including its 1e-6 union-volume clamp.
+    Geometry is float32; retain the previous 1e-6 union-volume clamp. The
+    axis-aligned formula has no rotated-BEV intersection tolerance.
     """
     if centers.shape[0] == 0:
         return centers.new_empty((0,), dtype=torch.long)
-    if not centers.is_cuda:
-        raise ValueError('MMCV reconstruction NMS requires CUDA tensors')
-
     order = scores.argsort().flip(0)
-    # MMCV uses geometric centers, sizes and yaw; these boxes are axis aligned.
+    # Use the same min/max convention as final detection NMS. Convert before
+    # computing corners so half/bfloat16 inputs do not lose more precision.
+    centers = centers.float()
+    half_sizes = sizes.float() / 2.0
     boxes = torch.cat([
-        centers.float(), sizes.float(), centers.new_zeros((len(centers), 1))
+        centers - half_sizes, centers + half_sizes
     ], dim=-1)[order].contiguous()
     sorted_classes = classes[order].cpu().numpy()
     kept = np.zeros(len(centers), dtype=np.bool_)
@@ -34,7 +36,9 @@ def _aligned_3d_nms(centers, sizes, scores, classes, threshold):
         # on the class (as happens at initialization).
         for start in range(0, count, 512):
             stop = min(start + 512, count)
-            iou = boxes_iou3d(class_boxes[start:stop], class_boxes)
+            iou = axis_aligned_bbox_overlaps_3d(
+                class_boxes[start:stop], class_boxes, mode='iou',
+                is_aligned=False, eps=1e-6)
             suppression[start:stop] = (iou > threshold).cpu().numpy()
         suppressed = np.zeros(count, dtype=np.bool_)
         for index in range(count):

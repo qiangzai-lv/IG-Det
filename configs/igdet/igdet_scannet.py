@@ -56,8 +56,14 @@ model = dict(
     ),
     deformable_num_points=4,
     reconstruction_nms_cfg=dict(
-        iou_thr=0.5,
+        iou_thr=0.7,
         foreground_score_thr=0.1),
+    instance_aggregation_cfg=dict(
+        enabled=True,
+        similarity_thr=0.5,
+        iou_thr=0.4,
+        max_supports=8,
+        anchor_weight=0.5),
     gt_points_dir=gt_points_dir,
     supervise_2d_bbox=False,
     train_2d_only=False,

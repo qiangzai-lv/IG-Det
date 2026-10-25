@@ -17,6 +17,7 @@ from igdet.device import autocast, get_device
 from igdet.feature_projection import VGGTFeatureProjector
 from igdet.geometry_attention import GeometryAwareDeformableDecoder
 from igdet.grounding_dino_encoder import GroundingDINOSemanticEncoder
+from igdet.instance_aggregation import InstanceQueryAggregator
 from igdet.query_correspondence import select_reconstruction_boxes
 from igdet.reconstruction_object_head import ReconstructionObjectHead
 from igdet.vggt_camera_loss import (
@@ -62,6 +63,7 @@ class IGDet(Base3DDetector):
             vggt_lora_cfg=None,
             deformable_num_points=4,
             reconstruction_nms_cfg=None,
+            instance_aggregation_cfg=None,
             gt_points_dir=None,
             supervise_2d_bbox=False,
             train_2d_only=False,
@@ -163,6 +165,12 @@ class IGDet(Base3DDetector):
         self.test_cfg = test_cfg
 
         self.num_queries = num_queries
+        aggregation_cfg = dict(instance_aggregation_cfg or {})
+        aggregation_enabled = aggregation_cfg.pop(
+            'enabled', instance_aggregation_cfg is not None)
+        self.instance_aggregator = (
+            InstanceQueryAggregator(**aggregation_cfg)
+            if aggregation_enabled else None)
         reconstruction_nms_cfg = dict(reconstruction_nms_cfg or {})
         unknown_nms_keys = set(reconstruction_nms_cfg) - {
             'iou_thr', 'foreground_score_thr'}
@@ -371,6 +379,15 @@ class IGDet(Base3DDetector):
             scene_ids=[sample.metainfo.get('scene_id', index)
                        for index, sample in enumerate(batch_data_samples)],
             foreground_score_thr=self.reconstruction_foreground_score_thr)
+        if self.instance_aggregator is not None:
+            anchor_centers_aligned = denormalize_vggt_gt_points(
+                selected['query_xyz_vggt'][:, None].detach(),
+                batch_inputs_dict['pose_matrix'],
+                batch_inputs_dict['axis_align_matrix'],
+                batch_inputs_dict['vggt_gt_scale'])[:, 0]
+            selected = self.instance_aggregator(
+                selected, selection_outputs, num_views,
+                anchor_centers_aligned, scene_scale)
         candidate_centers_vggt = reconstruction_outputs[
             'bbox_centers_vggt'].reshape(
                 batch_size, num_views * query_count, 3)
