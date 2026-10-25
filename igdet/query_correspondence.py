@@ -1,10 +1,49 @@
+import numpy as np
 import torch
-from mmdet3d.models.layers import aligned_3d_nms
+from mmcv.ops import boxes_iou3d
 
 
-def _center_size_to_minmax(centers, sizes):
-    half_sizes = sizes / 2.0
-    return torch.cat([centers - half_sizes, centers + half_sizes], dim=-1)
+@torch.no_grad()
+def _aligned_3d_nms(centers, sizes, scores, classes, threshold):
+    """Class-aware volume NMS using MMCV's CUDA 3D IoU operator.
+
+    Keep the legacy ascending-argsort/reverse traversal, including score ties.
+    Compute IoUs in row chunks and perform greedy suppression on CPU masks,
+    avoiding a CUDA synchronization for every selected box. Only geometry and
+    indices participate; query features stay on their original device.
+    IoU numerics follow MMCV, including its 1e-6 union-volume clamp.
+    """
+    if centers.shape[0] == 0:
+        return centers.new_empty((0,), dtype=torch.long)
+    if not centers.is_cuda:
+        raise ValueError('MMCV reconstruction NMS requires CUDA tensors')
+
+    order = scores.argsort().flip(0)
+    # MMCV uses geometric centers, sizes and yaw; these boxes are axis aligned.
+    boxes = torch.cat([
+        centers.float(), sizes.float(), centers.new_zeros((len(centers), 1))
+    ], dim=-1)[order].contiguous()
+    sorted_classes = classes[order].cpu().numpy()
+    kept = np.zeros(len(centers), dtype=np.bool_)
+    for label in np.unique(sorted_classes):
+        positions = np.flatnonzero(sorted_classes == label)
+        class_boxes = boxes[torch.as_tensor(positions, device=boxes.device)]
+        count = len(positions)
+        suppression = np.empty((count, count), dtype=np.bool_)
+        # Bound float32 IoU intermediates, even if all 8192 candidates agree
+        # on the class (as happens at initialization).
+        for start in range(0, count, 512):
+            stop = min(start + 512, count)
+            iou = boxes_iou3d(class_boxes[start:stop], class_boxes)
+            suppression[start:stop] = (iou > threshold).cpu().numpy()
+        suppressed = np.zeros(count, dtype=np.bool_)
+        for index in range(count):
+            if not suppressed[index]:
+                kept[positions[index]] = True
+                suppressed |= suppression[index]
+
+    keep_positions = torch.as_tensor(np.flatnonzero(kept), device=order.device)
+    return order[keep_positions]
 
 
 def _weighted_fps(points, scores, selected_points, count):
@@ -133,11 +172,10 @@ def select_reconstruction_boxes(
             valid[batch_id], as_tuple=False).flatten()
         candidate_scores = scores[batch_id, candidate_indices].detach()
         if candidate_indices.numel():
-            candidate_boxes = _center_size_to_minmax(
+            local_keep = _aligned_3d_nms(
                 nms_centers[batch_id, candidate_indices].detach(),
-                nms_sizes[batch_id, candidate_indices].detach())
-            local_keep = aligned_3d_nms(
-                candidate_boxes, candidate_scores,
+                nms_sizes[batch_id, candidate_indices].detach(),
+                candidate_scores,
                 labels[batch_id, candidate_indices].detach(), nms_iou_thr)
             local_keep = local_keep[candidate_scores[local_keep].argsort(
                 descending=True)]
