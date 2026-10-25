@@ -2,6 +2,7 @@
 import copy
 import re
 import warnings
+from collections import OrderedDict
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -12,6 +13,7 @@ from torch import Tensor
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
+from ..language_models.bert import BertModel
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
@@ -57,6 +59,7 @@ class GroundingDINO(DINO):
                  *args,
                  use_autocast=False,
                  freeze_modules=None,
+                 text_feature_cache_size=4,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -64,7 +67,82 @@ class GroundingDINO(DINO):
         self.use_autocast = use_autocast
         self.freeze_modules = tuple(freeze_modules or ())
         super().__init__(*args, **kwargs)
+        self.text_feature_cache_size = int(text_feature_cache_size)
+        self._text_feature_cache = OrderedDict()
         self._freeze_configured_modules()
+
+    def clear_text_feature_cache(self):
+        """Drop runtime-only features (never included in state_dict)."""
+        self._text_feature_cache.clear()
+
+    def _apply(self, fn, recurse=True):
+        self.clear_text_feature_cache()
+        return super()._apply(fn, recurse=recurse)
+
+    def _get_text_features(self, captions):
+        """Reuse complete batches only when the entire text branch is frozen.
+
+        Keep the original BERT/projection calls on misses, including their batch
+        shape and AMP context. Private detached copies protect cached features
+        from downstream mutation and can be reused by autograd after inference.
+        """
+        modules = [self.language_model]
+        if self.text_feat_map is not None:
+            modules.append(self.text_feat_map)
+        tensors = [tensor for module in modules
+                   for tensor in (*module.parameters(), *module.buffers())]
+        can_cache = self.text_feature_cache_size > 0 and not any(
+            child.training for module in modules for child in module.modules())
+        can_cache = can_cache and not any(t.requires_grad for t in tensors)
+        key = None
+        if can_cache:
+            device = next(self.language_model.parameters()).device
+            language = self.language_model
+            # With explicit position/type IDs these two HF BERT buffers are
+            # unused. DDP broadcasts bump their versions every step, so they
+            # must not invalidate otherwise identical frozen text features.
+            unused_buffers = set()
+            if (isinstance(language, BertModel)
+                    and language.use_sub_sentence_represent):
+                unused_buffers = {
+                    id(buffer) for name, buffer in language.named_buffers()
+                    if name in (
+                        'language_backbone.body.model.embeddings.position_ids',
+                        'language_backbone.body.model.embeddings.token_type_ids')
+                }
+            key = (
+                tuple(captions), language.max_tokens, language.pad_to_max,
+                language.use_sub_sentence_represent,
+                tuple(getattr(language, 'special_tokens', ())),
+                id(language.tokenizer),
+                tuple((id(t), t._version, t.device, t.dtype) for t in tensors
+                      if id(t) not in unused_buffers),
+                torch.is_autocast_enabled(device.type),
+                torch.get_autocast_dtype(device.type),
+                torch.get_float32_matmul_precision(),
+                torch.backends.cudnn.allow_tf32,
+            )
+            if key in self._text_feature_cache:
+                cached = self._text_feature_cache.pop(key)
+                self._text_feature_cache[key] = cached
+                return {name: value.clone() for name, value in cached.items()}
+        else:
+            self.clear_text_feature_cache()
+
+        text_dict = self.language_model(captions)
+        if self.text_feat_map is not None:
+            text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+        if key is not None:
+            # Normal tensors are needed when a cache populated by inference_mode
+            # is subsequently consumed by trainable image/text fusion layers.
+            with torch.inference_mode(False), torch.no_grad():
+                self._text_feature_cache[key] = {
+                    name: value.detach().clone()
+                    for name, value in text_dict.items()
+                }
+            while len(self._text_feature_cache) > self.text_feature_cache_size:
+                self._text_feature_cache.popitem(last=False)
+        return text_dict
 
     def _freeze_configured_modules(self):
         """Disable gradients and training-mode updates for selected modules."""
@@ -499,9 +577,7 @@ class GroundingDINO(DINO):
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
 
-        text_dict = self.language_model(new_text_prompts)
-        if self.text_feat_map is not None:
-            text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+        text_dict = self._get_text_features(new_text_prompts)
 
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
@@ -575,11 +651,7 @@ class GroundingDINO(DINO):
             for b in range(len(text_prompts[0])):
                 text_prompts_once = [text_prompts[0][b]]
                 token_positive_maps_once = token_positive_maps[0][b]
-                text_dict = self.language_model(text_prompts_once)
-                # text feature map layer
-                if self.text_feat_map is not None:
-                    text_dict['embedded'] = self.text_feat_map(
-                        text_dict['embedded'])
+                text_dict = self._get_text_features(text_prompts_once)
 
                 batch_data_samples[
                     0].token_positive_map = token_positive_maps_once
@@ -599,11 +671,7 @@ class GroundingDINO(DINO):
             is_rec_tasks = [False] * len(results_list)
         else:
             # extract text feats
-            text_dict = self.language_model(list(text_prompts))
-            # text feature map layer
-            if self.text_feat_map is not None:
-                text_dict['embedded'] = self.text_feat_map(
-                    text_dict['embedded'])
+            text_dict = self._get_text_features(list(text_prompts))
 
             is_rec_tasks = []
             for i, data_samples in enumerate(batch_data_samples):

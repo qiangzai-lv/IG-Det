@@ -187,7 +187,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 reconstruction_decoder.train(mode)
             self.model.bbox_head.reconstruction_head.train(mode)
             return self
-        for module_name in ('backbone', 'neck', 'encoder', 'language_model'):
+        for module_name in ('backbone', 'neck', 'encoder', 'language_model',
+                            'text_feat_map'):
             module = getattr(self.model, module_name, None)
             if module is not None:
                 module.eval()
