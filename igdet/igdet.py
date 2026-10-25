@@ -119,6 +119,8 @@ class IGDet(Base3DDetector):
             config=g_dino_cfg['grounding_dino_config'],
             checkpoint=g_dino_cfg['grounding_dino_checkpoint'],
             classes=g_dino_cfg['semantic_classes'],
+            cross_view_checkpointing=g_dino_cfg.get(
+                'cross_view_checkpointing', True),
             supervise_2d_bbox=supervise_2d_bbox,
             pretrain_2d_only=self.train_2d_only,
             reconstruction_depth_loss_weight=(

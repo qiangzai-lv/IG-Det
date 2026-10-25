@@ -79,8 +79,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  instance_consistency_cfg=None,
                  scene_query_exchange_cfg=None,
                  supervise_confident_query_depth: bool = False,
-                 confident_query_depth_cfg=None) -> None:
+                 confident_query_depth_cfg=None,
+                 cross_view_checkpointing: bool = True) -> None:
         super().__init__()
+        if not isinstance(cross_view_checkpointing, bool):
+            raise TypeError('cross_view_checkpointing must be boolean')
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
         self.classes = tuple(classes)
@@ -98,6 +101,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
             config_path = Path.cwd() / config_path
         cfg = Config.fromfile(str(config_path))
         model_cfg = deepcopy(cfg.model)
+        if model_cfg.get('reconstruction_decoder') is not None:
+            model_cfg.reconstruction_decoder.cross_view_checkpointing = (
+                cross_view_checkpointing)
         model_cfg['_scope_'] = 'mmdet'
         data_preprocessor_cfg = model_cfg['data_preprocessor']
         image_mean = data_preprocessor_cfg['mean']
