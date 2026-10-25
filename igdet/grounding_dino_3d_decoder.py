@@ -10,7 +10,6 @@ from mmcv.utils import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 from torch.utils.checkpoint import checkpoint
 
 from mmdet.models.layers.transformer.utils import coordinate_to_encoding
-from igdet.instance_context import InstanceContext
 
 
 @torch.no_grad()
@@ -424,13 +423,9 @@ class GroundingDINO3DDecoder(nn.Module):
         query = self.init_norm(learned_query + projected_semantic)
         return self.query_position_embedding(query, reference_points)
 
-    def forward(self, instance_context: InstanceContext, spatial_features,
-                valid_ratios,
+    def forward(self, semantic_query, spatial_features, reference_points,
+                valid_ratios, instance_embeddings=None, num_views=1,
                 correspondence_temperature=0.07):
-        semantic_query = instance_context.queries
-        reference_points = instance_context.positions_2d
-        instance_embeddings = instance_context.instance_embeddings
-        num_views = instance_context.num_views
 
         cross_reference_points = None
         cross_view_weights = None
