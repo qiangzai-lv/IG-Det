@@ -3,8 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-DATA_ROOT="${DATA_ROOT:-/root/shared-nvme/data/ScanNet_processed_v2}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/root/shared-nvme/data/scannet_coco_v2}"
+DATA_ROOT="${DATA_ROOT:-data/ScanNet_processed_v2}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-data/scannet_coco_v2}"
 NUM_VIEWS="${NUM_VIEWS:-50}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_ID="${SHARD_ID:-0}"
@@ -29,11 +29,13 @@ exec "${PYTHON_BIN}" utils/scannet_3d_to_coco_bbox.py \
   --num-views "${NUM_VIEWS}" \
   --sampling uniform \
   --depth-scale 1000 \
+  --abs-depth-tolerance 0.03 \
+  --rel-depth-tolerance 0.05 \
   --depth-window-radius 1 \
   --min-visible-points 3 \
   --min-visible-ratio 0.05 \
   --bbox-padding 2 \
-  --center-min-samples 3 \
+  --center-min-samples 10 \
   --center-window-fraction 0.1 \
   --center-window-min-size 2 \
   --center-window-max-size 6 \

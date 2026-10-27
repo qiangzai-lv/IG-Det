@@ -17,3 +17,22 @@ python utils/visualize_query_identity.py \
   --num-queries 100 \
   --query-color '#2F80ED' \
   --query-size 30
+
+
+
+# 生成全部训练场景标注，8 个进程并行
+DATA_ROOT=data/ScanNet_processed_v2 \
+OUTPUT_ROOT=data/scannet_coco_v2 \
+MAX_PARALLEL=8 \
+SPLIT=train \
+bash utils/generate_scannet_2d_all_shards.sh
+
+# 合并逐场景标注
+OUTPUT_ROOT=data/scannet_coco_v2 \
+SPLIT=train \
+bash utils/merge_scannet_2d_shards.sh
+
+
+conda run -n mmcv python /data/working/IG-Det/utils/visualize_training_instance_points.py \
+  --num-views -1 \
+  --output-dir /data/working/IG-Det/work_dirs/train_instance_points_all_views

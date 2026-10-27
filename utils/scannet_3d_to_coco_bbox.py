@@ -33,15 +33,15 @@ UNKNOWN = np.int8(-1)
 class GeneratorConfig:
     depth_scale: float = 1000.0
     abs_depth_tolerance: float = 0.05
-    rel_depth_tolerance: float = 0.01
+    rel_depth_tolerance: float = 0.05
     depth_window_radius: int = 1
     min_visible_points: int = 3
     min_visible_ratio: float = 0.2
     bbox_padding: float = 2.0
-    center_min_samples: int = 3
+    center_min_samples: int = 10
     center_window_fraction: float = 0.1
-    center_window_min_size: int = 2
-    center_window_max_size: int = 6
+    center_window_min_size: int = 2  # Legacy depth-window option; unused.
+    center_window_max_size: int = 6  # Legacy depth-window option; unused.
 
 
 @dataclass(frozen=True)
@@ -252,12 +252,13 @@ def project_aabb(
 
 def classify_depth_visibility(
         pixels: np.ndarray, depth: np.ndarray, depth_map: np.ndarray,
-        abs_tolerance: float = 0.05, rel_tolerance: float = 0.01,
+        abs_tolerance: float = 0.05, rel_tolerance: float = 0.05,
         window_radius: int = 1) -> np.ndarray:
     """Classify projected points against the measured depth surface.
 
     A point is visible when its camera-space depth is no farther than the
-    nearest valid depth sample in a small pixel neighbourhood. The operation
+    nearest valid depth sample plus 5 cm and 5% of that measured depth by
+    default. The operation
     is per point and never splits an instance into connected components.
     """
     if window_radius < 0:
@@ -294,13 +295,21 @@ def classify_depth_visibility(
     valid_indices = valid_indices[covered]
     nearest = nearest[covered]
     tolerance = (np.float32(abs_tolerance)
-                 + np.float32(rel_tolerance) * depth[valid_indices])
+                 + np.float32(rel_tolerance) * nearest)
     result[valid_indices] = (
         depth[valid_indices] <= nearest + tolerance).astype(np.int8)
     return result
 
 
 def assign_scene_points(points: np.ndarray, boxes: np.ndarray) -> PointAssignments:
+    """Keep geometric membership, but give each contained point one owner.
+
+    In an overlap, prefer the box with the greater intersection / own-volume
+    ratio. For any pair the intersection is shared, so this is the smaller
+    volume box. The same ordering resolves three or more containing boxes;
+    equal volumes prefer the earlier annotation. Membership remains the raw
+    containment matrix so overlap diagnostics can still inspect it.
+    """
     points = np.asarray(points, dtype=np.float32)
     boxes = np.asarray(boxes, dtype=np.float32)
     if boxes.size == 0:
@@ -312,10 +321,11 @@ def assign_scene_points(points: np.ndarray, boxes: np.ndarray) -> PointAssignmen
     membership = np.all(
         (points[:, None, :] >= lower[None])
         & (points[:, None, :] <= upper[None]), axis=2)
-    counts = membership.sum(axis=1)
     owner = np.full(len(points), -1, dtype=np.int32)
-    unique = counts == 1
-    owner[unique] = membership[unique].argmax(axis=1).astype(np.int32)
+    volumes = np.prod(boxes[:, 3:6].astype(np.float64), axis=1)
+    for box_index in np.argsort(volumes, kind='stable'):
+        take = membership[:, box_index] & (owner == -1)
+        owner[take] = box_index
     return PointAssignments(membership, owner)
 
 
@@ -437,7 +447,7 @@ def _prepare_objects(
         label = int(instance['bbox_label_3d'])
         if label not in category_by_label:
             raise ValueError(f'unknown bbox_label_3d {label}')
-        indices = np.flatnonzero(assignments.membership[:, list_index])
+        indices = np.flatnonzero(assignments.owner == list_index)
         exclusive = assignments.owner[indices] == list_index
         box = boxes[list_index]
         lower_z = box[2] - box[5] / 2.0
@@ -523,55 +533,43 @@ def _backproject_depth_pixel(pixel: np.ndarray, depth: float,
 def _estimate_center_geometry(
         obj: SceneObject, points: np.ndarray, geometry: ViewGeometry,
         bbox: Sequence[float], world_to_camera: np.ndarray, width: int,
-        height: int, config: GeneratorConfig) -> Tuple[Optional[float],
+        height: int, config: GeneratorConfig,
+        intrinsic: np.ndarray) -> Tuple[Optional[float],
                                                         Optional[list], int,
                                                         Optional[str]]:
+    """Use instance-point depths only, then backproject the RGB box center.
+
+    At least center_min_samples local visible points: average their depths.
+    Otherwise average the nearest center_min_samples visible instance points
+    in image space (all available if fewer exist). Depth images are used only
+    upstream for visibility, never as the source of this geometry target.
+    """
     x, y, box_width, box_height = map(float, bbox)
     center_rgb = np.array(
         [x + box_width / 2.0, y + box_height / 2.0], dtype=np.float32)
-    depth_height, depth_width = geometry.depth_map.shape
-    center_depth_pixel = center_rgb * np.array([
-        depth_width / float(width), depth_height / float(height)],
-        dtype=np.float32)
-    depth_box_size = min(
-        box_width * depth_width / float(width),
-        box_height * depth_height / float(height))
-    window_size = int(np.clip(
-        np.rint(2.0 * config.center_window_fraction * depth_box_size + 1.0),
-        config.center_window_min_size, config.center_window_max_size))
-    center_depth = _robust_depth_from_patch(
-        geometry.depth_map, center_depth_pixel, window_size)
-
     indices = obj.point_indices
     visible = ((geometry.visibility[indices] == VISIBLE)
                & geometry.in_image[indices])
+    visible &= np.isfinite(geometry.pixels[indices]).all(axis=1)
+    visible &= np.isfinite(geometry.depth[indices]) & (geometry.depth[indices] > 0)
+    indices = indices[visible]
+    if not len(indices):
+        return None, None, 0, None
     projected = geometry.pixels[indices]
     pixel_radius = max(
         2.0,
         config.center_window_fraction * min(box_width, box_height))
     near_center = np.linalg.norm(projected - center_rgb[None], axis=1)
-    center_point_mask = visible & (near_center <= pixel_radius)
-    center_points = points[indices][center_point_mask]
-    if len(center_points) >= config.center_min_samples:
-        mean_point = np.mean(center_points, axis=0, dtype=np.float32)
-        return (center_depth, mean_point.tolist(),
-                int(len(center_points)), 'instance_points')
-
-    if center_depth is not None:
-        point = _backproject_depth_pixel(
-            center_depth_pixel, center_depth, geometry.depth_intrinsic,
-            world_to_camera)
-        return center_depth, point.astype(np.float32).tolist(), 0, 'depth_backprojection'
-
-    visible_depths = geometry.depth[indices][visible]
-    if len(visible_depths):
-        fallback_depth = float(np.median(visible_depths))
-        point = _backproject_depth_pixel(
-            center_depth_pixel, fallback_depth, geometry.depth_intrinsic,
-            world_to_camera)
-        return (fallback_depth, point.astype(np.float32).tolist(), 0,
-                'visible_point_backprojection')
-    return None, None, 0, None
+    selected = indices[near_center <= pixel_radius]
+    source = 'instance_points_depth_mean'
+    if len(selected) < config.center_min_samples:
+        order = np.argsort(near_center, kind='stable')[:config.center_min_samples]
+        selected = indices[order]
+        source = 'nearest_instance_points_depth_mean'
+    center_depth = float(np.mean(geometry.depth[selected], dtype=np.float64))
+    point = _backproject_depth_pixel(
+        center_rgb, center_depth, intrinsic, world_to_camera)
+    return center_depth, point.tolist(), int(len(selected)), source
 
 
 def _infer_object(
@@ -620,7 +618,7 @@ def _infer_object(
     center_depth, center_3d, center_sample_count, center_source = (
         _estimate_center_geometry(
             obj, points, geometry, bbox, world_to_camera, width, height,
-            config))
+            config, intrinsic))
     return InstanceResult(
         obj.instance_id, obj.label + 1, obj.category_name, bbox,
         _xyxy_to_xywh(amodal), visible_count, visible_ratio,
@@ -634,7 +632,7 @@ def _process_view(
         objects: Iterable[SceneObject], view_index: int, image_id: int,
         config: GeneratorConfig) -> ViewResult:
     relative = Path(info['img_paths'][view_index])
-    image_path = relative if relative.is_absolute() else root / relative
+    image_path = root / relative
     with Image.open(image_path) as image:
         width, height = image.size
     depth_map = load_depth_map(root, relative, config.depth_scale)
@@ -690,7 +688,7 @@ def _save_view_visualization(
         root: Path, visualization_root: Path, scene_id: str,
         view: ViewResult) -> Path:
     relative = Path(view.file_name)
-    image_path = relative if relative.is_absolute() else root / relative
+    image_path = root / relative
     with Image.open(image_path) as source_image:
         image = source_image.convert('RGB')
     items = [
@@ -762,8 +760,6 @@ def convert(args: argparse.Namespace) -> None:
     root = Path(args.data_root).resolve()
     output_dir = Path(args.output_dir).resolve()
     annotation_path = Path(args.ann_file)
-    if not annotation_path.is_absolute():
-        annotation_path = root / annotation_path
     with annotation_path.open('rb') as handle:
         payload = pickle.load(handle)
     data_list = payload['data_list']
@@ -897,7 +893,8 @@ def convert(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data-root', required=True)
-    parser.add_argument('--ann-file', required=True)
+    parser.add_argument('--ann-file', required=True,
+                        help='Use this path directly; relative paths are relative to the working directory')
     parser.add_argument('--output-dir', '--output', dest='output_dir', required=True)
     parser.add_argument('--num-shards', type=int, default=1)
     parser.add_argument('--shard-id', type=int, default=0)
@@ -906,17 +903,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--max-scenes', type=int, default=-1)
     parser.add_argument('--abs-depth-tolerance', type=float, default=0.05)
-    parser.add_argument('--rel-depth-tolerance', type=float, default=0.01)
+    parser.add_argument('--rel-depth-tolerance', type=float, default=0.05)
     parser.add_argument('--depth-scale', type=float, default=1000.0)
     parser.add_argument('--depth-window-radius', type=int, default=1)
     parser.add_argument('--min-visible-points', type=int, default=3)
     parser.add_argument(
         '--min-visible-ratio', type=float, default=0.2,
         help='Reject an instance when less than this fraction of its 3D points is visible.')
-    parser.add_argument('--center-min-samples', type=int, default=3)
+    parser.add_argument('--center-min-samples', type=int, default=10,
+                        help='Minimum local points and nearest-point fallback count')
     parser.add_argument('--center-window-fraction', type=float, default=0.1)
-    parser.add_argument('--center-window-min-size', type=int, default=2)
-    parser.add_argument('--center-window-max-size', type=int, default=6)
+    parser.add_argument('--center-window-min-size', type=int, default=2,
+                        help='Legacy depth-window option; unused for point-cloud center labels')
+    parser.add_argument('--center-window-max-size', type=int, default=6,
+                        help='Legacy depth-window option; unused for point-cloud center labels')
     parser.add_argument('--bbox-padding', type=float, default=2.0)
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--visualization-dir')
