@@ -11,7 +11,7 @@ env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 custom_imports = dict(imports=['igdet'], allow_failed_imports=False)
 
 data_root = 'data/ScanNet_processed_v2/'
-scannet_ann_root = 'data/scannet_coco_v2/'
+scannet_ann_root = 'data/scannet_coco_v2_new/'
 gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = 'data/pretrain/vggt_omega_1b_512.pt'
 
@@ -289,10 +289,16 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(
         type='AdamW',
-        lr=2.5e-4,
+        lr=4e-4,
         weight_decay=1e-4
     ),
-    clip_grad=dict(max_norm=35., norm_type=2)
+    clip_grad=dict(max_norm=0.1, norm_type=2),
+    paramwise_cfg=dict(
+        custom_keys={
+            'absolute_pos_embed': dict(decay_mult=0.),
+            'backbone': dict(lr_mult=0.1),
+            'language_model': dict(lr_mult=0.1),
+        })
 )
 
 param_scheduler = [

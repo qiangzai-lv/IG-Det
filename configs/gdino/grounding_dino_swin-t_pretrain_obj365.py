@@ -8,14 +8,14 @@ custom_imports = dict(imports=['igdet'], allow_failed_imports=False)
 load_from = 'data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
 data_root = 'data/ScanNet_processed_v2/'
-scannet_ann_root = 'data/scannet_coco_v2/'
+scannet_ann_root = 'data/scannet_coco_v2_new/'
 
 lang_model_name = 'data/pretrain/bert-base-uncased'
 
 model = dict(
     type='IGGroundingDINO',
     num_queries=64,
-    freeze_modules=['language_model', 'backbone', 'neck', 'encoder'],
+    freeze_modules=['language_model'],
     with_box_refine=True,
     as_two_stage=True,
     data_preprocessor=dict(

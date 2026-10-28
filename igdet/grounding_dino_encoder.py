@@ -65,7 +65,7 @@ def require_pretrained_instance_projection(state_dict, projection):
 
 
 class GroundingDINOSemanticEncoder(nn.Module):
-    """Frozen Grounding DINO front-end with trainable 3D reconstruction."""
+    """Grounding DINO with stage-specific 2D and reconstruction training."""
 
     def __init__(self,
                  config: str,
@@ -161,6 +161,14 @@ class GroundingDINOSemanticEncoder(nn.Module):
             persistent=False)
 
     def _configure_model_trainability(self):
+        if self.pretrain_2d_only:
+            self.model.requires_grad_(True)
+            self.model._freeze_configured_modules()
+            # These modules belong to the inactive 3D reconstruction path.
+            if self.model.reconstruction_decoder is not None:
+                self.model.reconstruction_decoder.requires_grad_(False)
+            self.model.bbox_head.reconstruction_head.requires_grad_(False)
+            return
         self.model.requires_grad_(False)
         if self.supervise_2d_bbox or self.supervise_instance_consistency:
             for module in (self.model.query_embedding, self.model.decoder,
@@ -180,6 +188,13 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if self.pretrain_2d_only:
+            for module_name in self.model.freeze_modules:
+                getattr(self.model, module_name).eval()
+            if self.model.reconstruction_decoder is not None:
+                self.model.reconstruction_decoder.eval()
+            self.model.bbox_head.reconstruction_head.eval()
+            return self
         if not (self.supervise_2d_bbox
                 or self.supervise_instance_consistency):
             # GroundingDINO checks its root ``training`` flag to construct
@@ -198,11 +213,6 @@ class GroundingDINOSemanticEncoder(nn.Module):
             module = getattr(self.model, module_name, None)
             if module is not None:
                 module.eval()
-        if self.pretrain_2d_only:
-            reconstruction_decoder = self.model.reconstruction_decoder
-            if reconstruction_decoder is not None:
-                reconstruction_decoder.eval()
-            self.model.bbox_head.reconstruction_head.eval()
         return self
 
     def _ensure_token_positive_map(self):

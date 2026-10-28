@@ -11,7 +11,7 @@ env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 custom_imports = dict(imports=['igdet'], allow_failed_imports=False)
 
 data_root = 'data/ScanNet_processed_v2/'
-scannet_ann_root = 'data/scannet_coco_v2/'
+scannet_ann_root = 'data/scannet_coco_v2_new/'
 gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = 'data/pretrain/vggt_omega_1b_512.pt'
 
