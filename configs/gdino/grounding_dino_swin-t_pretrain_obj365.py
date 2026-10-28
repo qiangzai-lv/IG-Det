@@ -146,7 +146,7 @@ train_pipeline = [
     dict(type='RandomFlip', prob=0.5),
     dict(
         type='FixScaleResize',
-        scale=(448, 448),
+        scale=(320, 240),
         keep_ratio=True,
         backend='pillow'),
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),
@@ -163,7 +163,7 @@ test_pipeline = [
         imdecode_backend='pillow'),
     dict(
         type='FixScaleResize',
-        scale=(448, 448),
+        scale=(320, 240),
         keep_ratio=True,
         backend='pillow'),
     dict(type='LoadAnnotations', with_bbox=True),
