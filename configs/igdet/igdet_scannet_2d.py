@@ -289,16 +289,10 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(
         type='AdamW',
-        lr=4e-4,
+        lr=2.5e-4,
         weight_decay=1e-4
     ),
-    clip_grad=dict(max_norm=0.1, norm_type=2),
-    paramwise_cfg=dict(
-        custom_keys={
-            'absolute_pos_embed': dict(decay_mult=0.),
-            'backbone': dict(lr_mult=0.1),
-            'language_model': dict(lr_mult=0.1),
-        })
+    clip_grad=dict(max_norm=35., norm_type=2)
 )
 
 param_scheduler = [

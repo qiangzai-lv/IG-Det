@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from mmengine.logging import print_log
 from mmengine.runner.amp import autocast
 from torch import Tensor
 
@@ -70,6 +71,25 @@ class GroundingDINO(DINO):
         self.text_feature_cache_size = int(text_feature_cache_size)
         self._text_feature_cache = OrderedDict()
         self._freeze_configured_modules()
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        """Load the first N pretrained queries when reducing num_queries."""
+        key = prefix + 'query_embedding.weight'
+        weight = state_dict.get(key)
+        expected = self.query_embedding.weight
+        if (weight is not None and weight.ndim == expected.ndim
+                and weight.shape[1:] == expected.shape[1:]
+                and weight.shape[0] > expected.shape[0]):
+            print_log(
+                f'Truncating {key} from {weight.shape[0]} to '
+                f'{expected.shape[0]} queries (keeping the first rows).',
+                logger='current')
+            state_dict[key] = weight[:expected.shape[0]].clone()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs)
 
     def clear_text_feature_cache(self):
         """Drop runtime-only features (never included in state_dict)."""

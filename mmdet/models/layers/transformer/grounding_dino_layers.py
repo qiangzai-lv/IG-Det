@@ -154,17 +154,17 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
             SingleScaleBiAttentionBlock(**self.fusion_layer_cfg)
             for _ in range(self.num_layers)
         ])
-        self.embed_dims = self.layers[0].embed_dims
         if self.num_cp > 0:
             if checkpoint_wrapper is None:
                 raise NotImplementedError(
-                    'If you want to reduce GPU memory usage, \
-                    please install fairscale by executing the \
-                    following command: pip install fairscale.')
+                    'If you want to reduce GPU memory usage, '
+                    'please install fairscale by executing the '
+                    'following command: pip install fairscale.')
             for i in range(self.num_cp):
                 self.layers[i] = checkpoint_wrapper(self.layers[i])
-                self.fusion_layers[i] = checkpoint_wrapper(
-                    self.fusion_layers[i])
+                self.fusion_layers[i] = checkpoint_wrapper(self.fusion_layers[i])
+
+        self.embed_dims = self.layers[0].embed_dims
 
     def forward(self,
                 query: Tensor,
