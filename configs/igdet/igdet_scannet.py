@@ -15,7 +15,7 @@ scannet_ann_root = 'data/scannet_coco_v2_new/'
 gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = 'data/pretrain/vggt_omega_1b_512.pt'
 
-grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
+grounding_dino_config = 'configs/gdino/grounding_dino_vggt_joint_scannet.py'
 grounding_dino_checkpoint = 'data/pretrain/2d_sem_weight/epoch_1.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
@@ -38,6 +38,11 @@ model = dict(
         dropout=0.0,
         gradient_checkpointing=True,
         checkpoint_start_block=3),
+    # Must be a complete VGGT 2D checkpoint containing the detection pyramid.
+    detection_pyramid_cfg=dict(out_channels=256, norm_groups=32),
+    two_d_retention_cfg=dict(
+        checkpoint=grounding_dino_checkpoint,
+        detection_weight=0.1),
     g_dino_cfg=dict(
         grounding_dino_config=grounding_dino_config,
         grounding_dino_checkpoint=grounding_dino_checkpoint,
@@ -65,9 +70,9 @@ model = dict(
         max_supports=8,
         anchor_weight=0.5),
     gt_points_dir=gt_points_dir,
-    supervise_2d_bbox=False,
+    supervise_2d_bbox=True,
     train_2d_only=False,
-    supervise_instance_consistency=False,
+    supervise_instance_consistency=True,
     instance_consistency_cfg=dict(
         embedding_dims=128,
         temperature=0.1,

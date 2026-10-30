@@ -13,6 +13,7 @@ from mmdet.models.dense_heads.atss_vlfusion_head import (
     convert_grounding_to_cls_scores)
 from mmdet.structures import DetDataSample
 from mmdet.utils import register_all_modules
+from igdet.two_d_retention import is_2d_detector_state, require_complete_state
 
 
 def extract_grounding_dino_state_dict(state_dict):
@@ -80,7 +81,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  scene_query_exchange_cfg=None,
                  supervise_confident_query_depth: bool = False,
                  confident_query_depth_cfg=None,
-                 cross_view_checkpointing: bool = True) -> None:
+                 cross_view_checkpointing: bool = True,
+                 freeze_2d_modules: bool = False,
+                 pretrained_state_dict=None) -> None:
         super().__init__()
         if not isinstance(cross_view_checkpointing, bool):
             raise TypeError('cross_view_checkpointing must be boolean')
@@ -89,6 +92,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
         self.classes = tuple(classes)
         self.supervise_2d_bbox = bool(supervise_2d_bbox)
         self.pretrain_2d_only = bool(pretrain_2d_only)
+        self.freeze_2d_modules = bool(freeze_2d_modules)
+        if self.freeze_2d_modules and self.pretrain_2d_only:
+            raise ValueError('Cannot freeze the detector during 2D pretraining')
         self.supervise_instance_consistency = bool(
             supervise_instance_consistency)
         self.use_scene_query_exchange = bool(
@@ -128,9 +134,12 @@ class GroundingDINOSemanticEncoder(nn.Module):
         register_all_modules(init_default_scope=False)
         self.model = MMDET_MODELS.build(model_cfg)
         self.model.bbox_head.init_weights()
-        checkpoint_data = CheckpointLoader.load_checkpoint(
-            checkpoint, map_location='cpu')
-        state_dict = checkpoint_data.get('state_dict', checkpoint_data)
+        if pretrained_state_dict is None:
+            checkpoint_data = CheckpointLoader.load_checkpoint(
+                checkpoint, map_location='cpu')
+            state_dict = checkpoint_data.get('state_dict', checkpoint_data)
+        else:
+            state_dict = pretrained_state_dict
         state_dict = extract_grounding_dino_state_dict(state_dict)
         if getattr(self.model.backbone, 'requires_external_features', False):
             state_dict = {name: value for name, value in state_dict.items()
@@ -139,6 +148,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
             require_pretrained_instance_projection(
                 state_dict, self.model.bbox_head.instance_projection)
         query_weight = state_dict.get('query_embedding.weight')
+        if (self.freeze_2d_modules and query_weight is not None and
+                query_weight.shape != self.model.query_embedding.weight.shape):
+            raise ValueError(
+                'Frozen 2D retention requires the same query count/dimensions '
+                'as its 2D pretrained detector')
         if (query_weight is not None and
                 query_weight.shape != self.model.query_embedding.weight.shape and
                 query_weight.shape[1:] ==
@@ -146,6 +160,13 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 query_weight.shape[0] >= self.model.num_queries):
             state_dict['query_embedding.weight'] = query_weight[
                 :self.model.num_queries].clone()
+        if self.freeze_2d_modules:
+            expected = {k: v for k, v in self.model.state_dict().items()
+                        if is_2d_detector_state(k)}
+            require_complete_state(state_dict, expected, 'frozen 2D detector')
+            # Never initialize 3D reconstruction modules from inactive weights
+            # serialized by a 2D-only run.
+            state_dict = {k: v for k, v in state_dict.items() if is_2d_detector_state(k)}
         load_state_dict(self.model, state_dict, strict=False)
         self.model._is_init = True
 
@@ -164,6 +185,12 @@ class GroundingDINOSemanticEncoder(nn.Module):
             persistent=False)
 
     def _configure_model_trainability(self):
+        if getattr(self, 'freeze_2d_modules', False):
+            self.model.requires_grad_(False)
+            if self.model.reconstruction_decoder is not None:
+                self.model.reconstruction_decoder.requires_grad_(True)
+            self.model.bbox_head.reconstruction_head.requires_grad_(True)
+            return
         if self.pretrain_2d_only:
             self.model.requires_grad_(True)
             self.model._freeze_configured_modules()
@@ -191,6 +218,14 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if getattr(self, 'freeze_2d_modules', False):
+            # Root stays in train mode to preserve encoder/DN supervision.
+            for child in self.model.children():
+                child.eval()
+            if self.model.reconstruction_decoder is not None:
+                self.model.reconstruction_decoder.train(mode)
+            self.model.bbox_head.reconstruction_head.train(mode)
+            return self
         if self.pretrain_2d_only:
             for module_name in self.model.freeze_modules:
                 getattr(self.model, module_name).eval()
@@ -502,7 +537,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
     @torch.no_grad()
     def predict_reconstruction(self, images, batch_data_samples,
                                vggt_feature_maps, vggt_extrinsics,
-                               vggt_intrinsics):
+                               vggt_intrinsics, external_img_feats=None):
         padded_shape = images.shape[-2:]
         batch_size, num_views = images.shape[:2]
         self._ensure_token_positive_map()
@@ -525,10 +560,16 @@ class GroundingDINOSemanticEncoder(nn.Module):
             sample.metainfo['img_shape'] for sample in samples])
         vggt_valid_ratios = self._make_vggt_valid_ratios(
             image_shapes, padded_shape, len(flattened_vggt_features))
+        flattened_external_features = None
+        if external_img_feats is not None:
+            flattened_external_features = tuple(
+                feature.reshape(batch_size * num_views, *feature.shape[2:])
+                .contiguous() for feature in external_img_feats)
         was_training = self.model.training
         self.model.eval()
         view_predictions = self.model.predict(
             flattened, samples, rescale=False,
+            external_img_feats=flattened_external_features,
             vggt_feature_maps=flattened_vggt_features,
             vggt_extrinsics=flattened_extrinsics,
             vggt_intrinsics=flattened_intrinsics,
