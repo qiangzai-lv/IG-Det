@@ -17,6 +17,16 @@ from igdet.scene_query_exchange import SceneQueryExchange
 
 
 @MODELS.register_module()
+class ExternalFeatureBackbone(nn.Module):
+    """Placeholder for detectors using injected multi-scale visual features."""
+
+    requires_external_features = True
+
+    def forward(self, inputs):
+        raise RuntimeError('ExternalFeatureBackbone requires injected features')
+
+
+@MODELS.register_module()
 class IGGroundingDINO(GroundingDINO):
 
     def __init__(self, *args, reconstruction_decoder=None,
@@ -26,6 +36,7 @@ class IGGroundingDINO(GroundingDINO):
         if reconstruction_decoder is not None:
             self.reconstruction_decoder = GroundingDINO3DDecoder(
                 num_queries=self.num_queries, **reconstruction_decoder)
+        self._active_external_img_feats = None
         self._active_vggt_feature_maps = None
         self._active_vggt_extrinsics = None
         self._active_vggt_intrinsics = None
@@ -43,6 +54,20 @@ class IGGroundingDINO(GroundingDINO):
                     SceneQueryExchange(embed_dims=self.embed_dims, **cfg)
                     for _ in range(self.decoder.num_layers)
                 ])
+
+    @contextmanager
+    def _using_external_img_feats(self, feature_maps):
+        previous = self._active_external_img_feats
+        self._active_external_img_feats = feature_maps
+        try:
+            yield
+        finally:
+            self._active_external_img_feats = previous
+
+    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
+        if self._active_external_img_feats is not None:
+            return self._active_external_img_feats
+        return super().extract_feat(batch_inputs)
 
     def _exchange_detection_queries(self, query: Tensor, layer_id: int,
                                     num_views: int = None) -> Tensor:
@@ -290,8 +315,10 @@ class IGGroundingDINO(GroundingDINO):
              image_shapes=None,
              vggt_valid_ratios=None,
              num_views=1,
-             return_reconstruction=False) -> Union[dict, list]:
-        with self._using_vggt_features(
+             return_reconstruction=False,
+             external_img_feats=None) -> Union[dict, list]:
+        with self._using_external_img_feats(external_img_feats), \
+                self._using_vggt_features(
                 vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
                 image_shapes, vggt_valid_ratios=vggt_valid_ratios,
                 num_views=num_views):
@@ -310,8 +337,9 @@ class IGGroundingDINO(GroundingDINO):
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True,
                 vggt_feature_maps=None, vggt_extrinsics=None,
                 vggt_intrinsics=None, image_shapes=None,
-                vggt_valid_ratios=None, num_views=1):
-        with self._using_vggt_features(
+                vggt_valid_ratios=None, num_views=1, external_img_feats=None):
+        with self._using_external_img_feats(external_img_feats), \
+                self._using_vggt_features(
                 vggt_feature_maps, vggt_extrinsics, vggt_intrinsics,
                 image_shapes, vggt_valid_ratios=vggt_valid_ratios,
                 num_views=num_views):

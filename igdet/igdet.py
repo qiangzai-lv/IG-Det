@@ -14,7 +14,7 @@ from igdet.camera_alignment import (
 from igdet.detr3_models.helpers import GenericMLP
 from igdet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from igdet.device import autocast, get_device
-from igdet.feature_projection import VGGTFeatureProjector
+from igdet.feature_projection import VGGTDetectionPyramid, VGGTFeatureProjector
 from igdet.geometry_attention import GeometryAwareDeformableDecoder
 from igdet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from igdet.instance_aggregation import InstanceQueryAggregator
@@ -61,6 +61,7 @@ class IGDet(Base3DDetector):
             if_mix_precision=False,
             vggt_omega_checkpoint=None,
             vggt_lora_cfg=None,
+            detection_pyramid_cfg=None,
             deformable_num_points=4,
             reconstruction_nms_cfg=None,
             instance_aggregation_cfg=None,
@@ -84,6 +85,10 @@ class IGDet(Base3DDetector):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.train_2d_only = bool(train_2d_only)
+        self.use_vggt_2d_features = (
+            self.train_2d_only and detection_pyramid_cfg is not None)
+        if detection_pyramid_cfg is not None and not self.train_2d_only:
+            raise ValueError('detection_pyramid_cfg is supported in 2D mode only')
 
         bbox_head.update(train_cfg=train_cfg)
         bbox_head.update(test_cfg=test_cfg)
@@ -163,6 +168,17 @@ class IGDet(Base3DDetector):
             out_channels=[token_dim] * len(
                 dense_head.intermediate_layer_idx))
 
+        self.detection_feature_projector = None
+        if self.use_vggt_2d_features:
+            self.detection_feature_projector = VGGTDetectionPyramid(
+                dense_head=dense_head, **dict(detection_pyramid_cfg))
+        uses_external = getattr(
+            self.semantic_encoder.model.backbone, 'requires_external_features', False)
+        if uses_external != self.use_vggt_2d_features:
+            raise ValueError(
+                'ExternalFeatureBackbone and 2D detection_pyramid_cfg '
+                'must be enabled together')
+
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
 
@@ -210,7 +226,7 @@ class IGDet(Base3DDetector):
 
     def _configure_2d_pretrain_trainability(self):
         frozen_modules = (
-            self.vggt_encoder, self.feature_projector,
+            self.feature_projector,
             self.reconstruction_object_head,
             self.decoder, self.bbox_head,
             self.pos_embedding, self.query_projection)
@@ -218,14 +234,23 @@ class IGDet(Base3DDetector):
             module.requires_grad_(False)
             module.eval()
 
+        if self.use_vggt_2d_features:
+            self.detection_feature_projector.requires_grad_(True)
+            self.detection_feature_projector.train(self.training)
+        else:
+            self.vggt_encoder.requires_grad_(False)
+            self.vggt_encoder.eval()
+
     def _configure_vggt_trainability(self, training):
         self.vggt_encoder.requires_grad_(False)
         self.vggt_encoder.eval()
-        if self.train_2d_only:
+        if self.train_2d_only and not self.use_vggt_2d_features:
             return
         if self.vggt_lora_enabled:
             enable_lora_parameters(self.vggt_encoder.aggregator)
             self.vggt_encoder.aggregator.train(bool(training))
+        if self.train_2d_only:
+            return
         camera_head = self.vggt_encoder.camera_head
         camera_head.requires_grad_(self.supervise_camera_head)
         camera_head.train(bool(training and self.supervise_camera_head))
@@ -248,6 +273,12 @@ class IGDet(Base3DDetector):
                 aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(
                     img)
                 return aggregated_tokens_list, ps_idx, img
+
+    def _extract_2d_detection_features(self, batch_inputs_dict,
+                                       batch_data_samples, mode):
+        tokens, patch_start, images = self.extract_feat(
+            batch_inputs_dict, batch_data_samples, mode)
+        return self.detection_feature_projector(tokens, images, patch_start)
 
     def _load_axis_aligned_gt_points(self, metadata):
         lidar_path = Path(metadata['lidar_path'])
@@ -469,10 +500,15 @@ class IGDet(Base3DDetector):
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
         if self.train_2d_only:
+            feature_kwargs = {}
+            if self.use_vggt_2d_features:
+                feature_kwargs['external_img_feats'] = (
+                    self._extract_2d_detection_features(
+                        batch_inputs_dict, batch_data_samples, 'train'))
             semantic_losses = self.semantic_encoder.loss(
                 batch_inputs_dict['imgs'],
                 batch_data_samples,
-                return_reconstruction=False)
+                return_reconstruction=False, **feature_kwargs)
             return {f'gdino_{name}': value
                     for name, value in semantic_losses.items()}
 
@@ -538,8 +574,13 @@ class IGDet(Base3DDetector):
                 **kwargs) -> SampleList:
 
         if self.train_2d_only:
+            feature_kwargs = {}
+            if self.use_vggt_2d_features:
+                feature_kwargs['external_img_feats'] = (
+                    self._extract_2d_detection_features(
+                        batch_inputs_dict, batch_data_samples, 'test'))
             return self.semantic_encoder.predict_scene_2d(
-                batch_inputs_dict['imgs'], batch_data_samples)
+                batch_inputs_dict['imgs'], batch_data_samples, **feature_kwargs)
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'test')

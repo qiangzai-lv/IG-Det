@@ -15,7 +15,7 @@ scannet_ann_root = 'data/scannet_coco_v2_new/'
 gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = 'data/pretrain/vggt_omega_1b_512.pt'
 
-grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
+grounding_dino_config = 'configs/gdino/grounding_dino_vggt_pretrain_scannet.py'
 grounding_dino_checkpoint = 'data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
@@ -38,7 +38,9 @@ model = dict(
         dropout=0.0,
         gradient_checkpointing=True,
         checkpoint_start_block=3),
+    detection_pyramid_cfg=dict(out_channels=256, norm_groups=32),
     g_dino_cfg=dict(
+        cross_view_checkpointing=True,
         grounding_dino_config=grounding_dino_config,
         grounding_dino_checkpoint=grounding_dino_checkpoint,
         semantic_classes=grounding_dino_classes),
@@ -92,7 +94,7 @@ model = dict(
         center_weight=0.5,
         size_weight=1.0,
         giou_weight=0.5),
-    supervise_camera_head=True,
+    supervise_camera_head=False,
     prediction_visualization=False,
     prediction_visualization_dir='work_dirs/igdet_visualizations',
     prediction_visualization_score_thr=0.1,
@@ -104,7 +106,7 @@ model = dict(
         weight_rot=1.0,
         weight_focal=0.5,
         min_valid_points=100),
-    supervise_confident_query_depth=True,
+    supervise_confident_query_depth=False,
     confident_query_depth_cfg=dict(
         score_thr=0.05,
         loss_weight=5.0,
@@ -200,7 +202,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=80,
+        n_images=64,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(320, 240), keep_ratio=True, interpolation='bicubic'),
@@ -292,6 +294,12 @@ optim_wrapper = dict(
         lr=2.5e-4,
         weight_decay=1e-4
     ),
+    paramwise_cfg=dict(custom_keys={
+        'detection_feature_projector.norm': dict(lr_mult=0.1),
+        'detection_feature_projector.projects': dict(lr_mult=0.1),
+        'detection_feature_projector.resize_layers': dict(lr_mult=0.1),
+        'semantic_encoder.model.encoder': dict(lr_mult=0.1),
+    }),
     clip_grad=dict(max_norm=35., norm_type=2)
 )
 
