@@ -75,17 +75,26 @@ class InstancePriorScaleRecovery(nn.Module):
         sizes = torch.as_tensor(prior['metric_size_priors'], dtype=torch.float32)
         valid = torch.as_tensor(prior['valid_modes'], dtype=torch.bool)
         counts = torch.as_tensor(prior['mode_counts'], dtype=torch.long)
+        fixed = torch.as_tensor(prior.get('fixed_prior_mask', torch.zeros_like(valid)), dtype=torch.bool)
+        replicated = torch.as_tensor(
+            prior.get('replicated_prior_mask', torch.zeros_like(valid)), dtype=torch.bool)
         if (sizes.ndim != 3 or sizes.shape[0] != len(classes) or sizes.shape[-1] != 3
-                or valid.shape != sizes.shape[:2] or counts.shape != valid.shape):
+                or valid.shape != sizes.shape[:2] or counts.shape != valid.shape
+                or fixed.shape != valid.shape or replicated.shape != valid.shape):
             raise ValueError('invalid prior tensor shapes')
         if (not valid.any(dim=1).all() or not torch.isfinite(sizes).all()
                 or (sizes <= 0).any() or (counts < 0).any()
-                or (counts[valid] <= 0).any()):
+                or (counts[valid & ~fixed & ~replicated] <= 0).any()
+                or ((fixed | replicated) & ~valid).any()
+                or (fixed & replicated).any()
+                or (counts[fixed | replicated] != 0).any()):
             raise ValueError('every category requires finite positive populated size priors')
         self.classes = tuple(classes)
         self.register_buffer('metric_size_priors', sizes)
         self.register_buffer('valid_modes', valid)
         self.register_buffer('mode_counts', counts)
+        self.register_buffer('fixed_prior_mask', fixed)
+        self.register_buffer('replicated_prior_mask', replicated)
         self.register_buffer('query_prototypes', torch.zeros(*valid.shape, embed_dims))
         self.register_buffer('prototype_counts', torch.zeros_like(counts))
         self.embed_dims = embed_dims

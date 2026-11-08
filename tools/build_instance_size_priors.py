@@ -16,7 +16,8 @@ from mmdet3d.registry import DATASETS
 from igdet.size_priors import build_size_priors
 
 
-def build_from_config(config, output, max_modes=4, min_samples_per_mode=8, seed=0):
+def build_from_config(config, output, num_modes=4, seed=0,
+                      missing_class_size=None):
     cfg = Config.fromfile(config)
     if cfg.get('custom_imports'):
         import_modules_from_strings(**cfg.custom_imports)
@@ -51,7 +52,8 @@ def build_from_config(config, output, max_modes=4, min_samples_per_mode=8, seed=
     if not all_sizes:
         raise ValueError('Training dataset is empty')
     artifact = build_size_priors(torch.cat(all_sizes), torch.cat(all_labels), classes,
-                                 max_modes, min_samples_per_mode, seed)
+                                 num_modes=num_modes, seed=seed,
+                                 missing_class_size=missing_class_size)
     annotation_path = Path(dataset.ann_file)
     artifact.update(source_annotation=str(annotation_path.resolve()),
                     source_sha256=hashlib.sha256(annotation_path.read_bytes()).hexdigest(),
@@ -67,12 +69,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config')
     parser.add_argument('--output', required=True)
-    parser.add_argument('--max-modes', type=int, default=4)
-    parser.add_argument('--min-samples-per-mode', type=int, default=8)
+    parser.add_argument('--num-modes', '--max-modes', dest='num_modes', type=int, default=4,
+                        help='Fixed K-means prior count per category (default: 4)')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--missing-class-size', type=float, nargs=3, default=None,
+                        metavar=('X', 'Y', 'Z'),
+                        help='Explicit fixed metric size for categories absent from training data')
     args = parser.parse_args()
-    artifact = build_from_config(args.config, args.output, args.max_modes,
-                                  args.min_samples_per_mode, args.seed)
+    artifact = build_from_config(args.config, args.output, args.num_modes,
+                                  args.seed, args.missing_class_size)
+    fixed = artifact['fixed_prior_mask'].any(dim=1)
+    if fixed.any():
+        print('Fixed placeholder priors (zero training examples): ' +
+              ', '.join(name for name, flag in zip(artifact['classes'], fixed) if flag))
+    repeated = artifact['replicated_prior_mask'].sum().item()
+    if repeated:
+        print(f'Repeated populated centers in {repeated} zero-count slots to preserve fixed K')
     print(f"Saved {int(artifact['valid_modes'].sum())} modes from "
           f"{artifact['scene_count']} training scenes to {args.output}")
 

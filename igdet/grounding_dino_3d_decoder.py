@@ -294,7 +294,7 @@ class GroundingDINO3DDecoderLayer(nn.Module):
     def _cross_view_forward(self, query, query_pos, spatial_features,
                             valid_ratios, spatial_key_padding_mask, num_views,
                             cross_reference_points, cross_view_weights,
-                            cross_query_positions=None):
+                            cross_query_positions=None, cross_query_indices=None):
         spatial_value, spatial_shapes, spatial_level_start = spatial_features
         num_flat_views, num_queries, _ = query.shape
         if num_views <= 1:
@@ -303,13 +303,15 @@ class GroundingDINO3DDecoderLayer(nn.Module):
         expected_references = (
             batch_size, num_views, num_queries, num_views, 2)
         expected_positions = expected_references[:-1] + (query.shape[-1],)
-        if cross_query_positions is None:
+        if cross_query_positions is None and cross_query_indices is None:
             cross_query_positions = query_pos.reshape(
                 batch_size, num_views, num_queries, 1, -1).expand(
                 expected_positions)
-        elif cross_query_positions.shape != expected_positions:
+        elif cross_query_positions is not None and cross_query_positions.shape != expected_positions:
             raise ValueError(
                 f'cross_query_positions must have shape {expected_positions}')
+        if cross_query_indices is not None and cross_query_indices.shape != expected_references[:-1]:
+            raise ValueError('cross-query indices must have shape [B, V, Q, V]')
 
         _, sequence_length, spatial_dims = spatial_value.shape
         num_levels = valid_ratios.shape[1]
@@ -338,8 +340,19 @@ class GroundingDINO3DDecoderLayer(nn.Module):
         for target_view in range(num_views):
             target_references = cross_reference_points[
                 ..., target_view, :].reshape(num_flat_views, num_queries, 2)
-            target_positions = cross_query_positions[
-                ..., target_view, :].reshape_as(query_pos)
+            if cross_query_indices is not None:
+                # Projection is pointwise: gather the target query's already
+                # projected position instead of materializing [B,V,Q,V,D].
+                candidates = query_pos.reshape(
+                    batch_size, num_views, num_queries, -1)[:, target_view]
+                target_indices = cross_query_indices[..., target_view]
+                target_positions = candidates[:, None].expand(
+                    -1, num_views, -1, -1).gather(
+                        2, target_indices[..., None].expand(
+                            -1, -1, -1, query_pos.shape[-1])).reshape_as(query_pos)
+            else:
+                target_positions = cross_query_positions[
+                    ..., target_view, :].reshape_as(query_pos)
             attention_inputs = (
                 projected_query, target_positions,
                 values_by_view[:, target_view],
@@ -362,7 +375,7 @@ class GroundingDINO3DDecoderLayer(nn.Module):
     def forward(self, query, query_pos, spatial_features, reference_points,
                 valid_ratios, num_views=1, cross_reference_points=None,
                 cross_view_weights=None, cross_query_positions=None,
-                spatial_key_padding_mask=None):
+                spatial_key_padding_mask=None, cross_query_indices=None):
         spatial_value, spatial_shapes, spatial_level_start = spatial_features
         if spatial_key_padding_mask is None:
             spatial_key_padding_mask = build_spatial_key_padding_mask(
@@ -377,7 +390,7 @@ class GroundingDINO3DDecoderLayer(nn.Module):
             cross_view = self._cross_view_forward(
                 query, query_pos, spatial_features, valid_ratios,
                 spatial_key_padding_mask, num_views, cross_reference_points,
-                cross_view_weights, cross_query_positions)
+                cross_view_weights, cross_query_positions, cross_query_indices)
             query = query + self.dropout(
                 self.cross_view_residual_scale * cross_view)
 
@@ -437,6 +450,7 @@ class GroundingDINO3DDecoder(nn.Module):
         cross_reference_points = None
         cross_view_weights = None
         cross_query_positions = None
+        cross_query_indices = None
         if num_views > 1:
             batch_size = semantic_query.shape[0] // num_views
             embeddings_by_scene = instance_embeddings.reshape(
@@ -449,11 +463,7 @@ class GroundingDINO3DDecoder(nn.Module):
                     temperature=correspondence_temperature))
             cross_reference_points = gather_multiview_reference_points(
                 references_by_scene, top_indices)
-            flat_cross_references = cross_reference_points.reshape(
-                semantic_query.shape[0], self.num_queries * num_views, 2)
-            cross_query_positions = self.reference_projection(
-                coordinate_to_encoding(flat_cross_references)).reshape(
-                batch_size, num_views, self.num_queries, num_views, -1)
+            cross_query_indices = top_indices
 
         query = self.initialize_query(semantic_query, reference_points)
         query_pos = self.reference_projection(
@@ -472,6 +482,7 @@ class GroundingDINO3DDecoder(nn.Module):
                 cross_reference_points=cross_reference_points,
                 cross_view_weights=cross_view_weights,
                 cross_query_positions=cross_query_positions,
-                spatial_key_padding_mask=spatial_key_padding_mask)
+                spatial_key_padding_mask=spatial_key_padding_mask,
+                cross_query_indices=cross_query_indices)
             intermediate.append(self.norm(query))
         return torch.stack(intermediate)
