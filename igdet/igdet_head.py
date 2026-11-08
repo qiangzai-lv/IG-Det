@@ -203,8 +203,10 @@ class IGDetHead(BaseModule):
             cls_preds=cls_preds)
 
     @staticmethod
-    def _align_detection_outputs(outputs, batch_inputs_dict):
-        required = ('pose_matrix', 'axis_align_matrix', 'vggt_gt_scale')
+    def _align_detection_outputs(outputs, batch_inputs_dict, scene_scale=None):
+        required = ('pose_matrix', 'axis_align_matrix')
+        if scene_scale is None:
+            required += ('vggt_gt_scale',)
         missing = [key for key in required if key not in batch_inputs_dict]
         if missing:
             raise KeyError(
@@ -221,7 +223,8 @@ class IGDetHead(BaseModule):
                 sizes_vggt.transpose(1, 2),
                 batch_inputs_dict['pose_matrix'],
                 batch_inputs_dict['axis_align_matrix'],
-                batch_inputs_dict['vggt_gt_scale'])
+                (batch_inputs_dict['vggt_gt_scale']
+                 if scene_scale is None else scene_scale))
             centers = centers.transpose(1, 2)
             sizes = sizes.transpose(1, 2)
             aligned_centers.append(centers)
@@ -234,12 +237,13 @@ class IGDetHead(BaseModule):
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
              batch_inputs_dict: dict, refined_query_xyz=None,
-             initial_query_sizes=None, **kwargs) -> dict:
+             initial_query_sizes=None, normalized_outputs=None,
+             return_matches=False, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
         layer_ids = self.loss_layer_ids
-        outputs = self(
-            x, batch_inputs_dict, refined_query_xyz, initial_query_sizes)
+        outputs = (normalized_outputs if normalized_outputs is not None else self(
+            x, batch_inputs_dict, refined_query_xyz, initial_query_sizes))
         outputs = self._align_detection_outputs(outputs, batch_inputs_dict)
 
         if 'points' in batch_inputs_dict.keys():
@@ -261,7 +265,7 @@ class IGDetHead(BaseModule):
                        outputs['size_log_preds'], outputs['cls_preds'], layer_ids,
                        batch_gt_instances_3d, batch_input_metas,
                        batch_input_points, batch_gt_instances_ignore)
-        losses = self.loss_by_feat(*loss_inputs)
+        losses = self.loss_by_feat(*loss_inputs, return_matches=return_matches)
         return losses
 
     def loss_by_feat(self,
@@ -275,12 +279,13 @@ class IGDetHead(BaseModule):
                      batch_input_metas: List[dict],
                      batch_input_points,
                      batch_gt_instances_ignore: OptInstanceList = None,
-                     **kwargs) -> dict:
+                     return_matches=False, **kwargs) -> dict:
 
         if layer_ids[-1] >= len(center_preds):
             raise ValueError('Supervised layer id exceeds predictions')
 
         losses_by_layer = []
+        final_matches = None
         for layer_id in layer_ids:
             center_losses = []
             size_losses = []
@@ -298,6 +303,8 @@ class IGDetHead(BaseModule):
                     gt_bboxes.gravity_center,
                     gt_sizes,
                     batch_gt_instances_3d[batch_id].labels_3d))
+            if layer_id == layer_ids[-1]:
+                final_matches = matches
             local_num_pos = sum(match[0].numel() for match in matches)
             avg_factor = reduce_mean(center_preds[layer_id][0].new_tensor(
                 [local_num_pos], dtype=torch.float32)).clamp_min(1.0).item()
@@ -333,7 +340,7 @@ class IGDetHead(BaseModule):
             prefix = '' if layer_id == main_layer_id else f'd{layer_id}.'
             for name, value in layer_losses.items():
                 loss_dict[f'{prefix}{name}'] = value
-        return loss_dict
+        return (loss_dict, final_matches) if return_matches else loss_dict
 
     def _loss_by_feat_single(self, center_pred, size_pred,
                              size_log_pred, cls_pred, input_meta,
@@ -398,15 +405,17 @@ class IGDetHead(BaseModule):
                 batch_data_samples: SampleList, batch_inputs_dict,
                 refined_query_xyz=None, initial_query_sizes=None,
                 layer_ids=None,
-                rescale: bool = False) -> InstanceList:
+                rescale: bool = False, normalized_outputs=None,
+                scene_scale=None) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outputs = self(
+        outputs = (normalized_outputs if normalized_outputs is not None else self(
             x, batch_inputs_dict, refined_query_xyz,
-            initial_query_sizes, layer_ids)
-        outputs = self._align_detection_outputs(outputs, batch_inputs_dict)
+            initial_query_sizes, layer_ids))
+        outputs = self._align_detection_outputs(
+            outputs, batch_inputs_dict, scene_scale=scene_scale)
         predictions = self.predict_by_feat(
             [outputs['center_preds'][-1]],
             [outputs['size_preds'][-1]],

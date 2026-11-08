@@ -1,7 +1,6 @@
 import numpy as np
 import torch
-from mmdet3d.structures.ops.iou3d_calculator import (
-    axis_aligned_bbox_overlaps_3d)
+from igdet.box_geometry import axis_aligned_iou
 
 
 @torch.no_grad()
@@ -12,7 +11,7 @@ def _aligned_3d_nms(centers, sizes, scores, classes, threshold):
     Compute IoUs in row chunks and perform greedy suppression on CPU masks,
     avoiding a device synchronization for every selected box. Only geometry and
     indices participate; query features stay on their original device.
-    Geometry is float32; retain the previous 1e-6 union-volume clamp. The
+    Geometry is float32 with no unit-dependent union-volume floor. The
     axis-aligned formula has no rotated-BEV intersection tolerance.
     """
     if centers.shape[0] == 0:
@@ -36,9 +35,7 @@ def _aligned_3d_nms(centers, sizes, scores, classes, threshold):
         # on the class (as happens at initialization).
         for start in range(0, count, 512):
             stop = min(start + 512, count)
-            iou = axis_aligned_bbox_overlaps_3d(
-                class_boxes[start:stop], class_boxes, mode='iou',
-                is_aligned=False, eps=1e-6)
+            iou = axis_aligned_iou(class_boxes[start:stop], class_boxes)
             suppression[start:stop] = (iou > threshold).cpu().numpy()
         suppressed = np.zeros(count, dtype=np.bool_)
         for index in range(count):
@@ -99,9 +96,9 @@ def select_reconstruction_boxes(
     per_query_keys = (
         'bbox_centers_vggt', 'bbox_sizes_vggt', 'bbox_scores',
         'bbox_labels', 'class_scores_2d', 'fused_detection_query',
-        'points_vggt', 'valid_mask', 'nms_centers_aligned',
-        'nms_sizes_aligned')
-    required = per_query_keys + ('fallback_size_vggt',)
+        'points_vggt', 'valid_mask', 'iou_centers_normalized',
+        'iou_sizes_normalized')
+    required = per_query_keys
     missing = [key for key in required if key not in reconstruction_outputs]
     if missing:
         raise KeyError(f'Missing reconstruction outputs: {missing}')
@@ -126,10 +123,9 @@ def select_reconstruction_boxes(
     centers = reconstruction_outputs['bbox_centers_vggt'].reshape(
         batch_size, num_views * query_count, 3)
     sizes = reconstruction_outputs['bbox_sizes_vggt'].reshape_as(centers)
-    nms_centers = reconstruction_outputs['nms_centers_aligned'].reshape_as(
+    nms_centers = reconstruction_outputs['iou_centers_normalized'].reshape_as(
         centers)
-    nms_sizes = reconstruction_outputs['nms_sizes_aligned'].reshape_as(centers)
-    default_fallback_sizes = reconstruction_outputs['fallback_size_vggt']
+    nms_sizes = reconstruction_outputs['iou_sizes_normalized'].reshape_as(centers)
     scores = reconstruction_outputs['bbox_scores'].reshape(
         batch_size, num_views * query_count)
     labels = reconstruction_outputs['bbox_labels'].reshape_as(scores).long()
@@ -208,44 +204,32 @@ def select_reconstruction_boxes(
                 ~torch.isin(fallback_pool, selected_indices)]
             if remaining.numel() == 0:
                 remaining = fallback_pool
-            if remaining.numel():
-                fallback_indices = _weighted_fps(
-                    reconstruction_points[batch_id, remaining],
-                    foreground_scores_2d[batch_id, remaining],
-                    reconstruction_points[batch_id, selected_indices],
-                    fallback_count)
-                fallback_source_indices = remaining[fallback_indices]
-                fallback_centers = reconstruction_points[
-                    batch_id, fallback_source_indices].detach()
-                fallback_sizes_for_scene = sizes[
-                    batch_id, fallback_source_indices].detach()
-                fallback_queries = queries[
-                    batch_id, fallback_source_indices].detach()
-                fallback_scores = scores[
-                    batch_id, fallback_source_indices].detach()
-                fallback_scores = torch.where(
-                    torch.isfinite(fallback_scores), fallback_scores,
-                    foreground_scores_2d[
-                        batch_id, fallback_source_indices].detach())
-                fallback_labels = labels[
-                    batch_id, fallback_source_indices].detach()
-            else:
-                fallback_source_indices = torch.full(
-                    (fallback_count,), -1, dtype=torch.long,
-                    device=centers.device)
-                fallback_centers = centers.new_zeros(fallback_count, 3)
-                fallback_sizes_for_scene = default_fallback_sizes[
-                    batch_id].expand(fallback_count, -1)
-                fallback_queries = queries.new_zeros(
-                    fallback_count, query_dims)
-                fallback_scores = scores.new_zeros(fallback_count)
-                fallback_labels = labels.new_zeros(fallback_count)
+            if remaining.numel() == 0:
                 scene_id = (
                     batch_id if scene_ids is None else scene_ids[batch_id])
-                logger.error(
-                    'No finite reconstruction data for weighted FPS; using '
-                    f'deterministic VGGT-origin fallback: scene={scene_id} '
-                    f'fallback={fallback_count}')
+                raise RuntimeError(
+                    'No usable reconstruction observations for weighted FPS: '
+                    f'scene={scene_id}')
+            fallback_indices = _weighted_fps(
+                reconstruction_points[batch_id, remaining],
+                foreground_scores_2d[batch_id, remaining],
+                reconstruction_points[batch_id, selected_indices],
+                fallback_count)
+            fallback_source_indices = remaining[fallback_indices]
+            fallback_centers = reconstruction_points[
+                batch_id, fallback_source_indices].detach()
+            fallback_sizes_for_scene = sizes[
+                batch_id, fallback_source_indices].detach()
+            fallback_queries = queries[
+                batch_id, fallback_source_indices].detach()
+            fallback_scores = scores[
+                batch_id, fallback_source_indices].detach()
+            fallback_scores = torch.where(
+                torch.isfinite(fallback_scores), fallback_scores,
+                foreground_scores_2d[
+                    batch_id, fallback_source_indices].detach())
+            fallback_labels = labels[
+                batch_id, fallback_source_indices].detach()
             selected_centers = torch.cat(
                 [selected_centers, fallback_centers], dim=0)
             selected_sizes = torch.cat(

@@ -23,6 +23,26 @@ def _batch_matrix(value, reference, batch_size, name):
     return matrix
 
 
+def rotate_vggt_points_to_scene_axes(points, first_frame_pose,
+                                     axis_align_matrix):
+    """Rotate normalized centers onto the box-size axes, without scale/shift.
+
+    Dimensions already follow aligned-scene axes. These temporary centers are
+    only for AABB overlap tests; decoder references stay in the VGGT frame.
+    """
+    if points.ndim < 3 or points.shape[-1] != 3:
+        raise ValueError('points must have shape [B, ..., 3]')
+    with torch.autocast(device_type=points.device.type, enabled=False):
+        pose = _batch_matrix(
+            first_frame_pose, points, points.shape[0], 'first_frame_pose')
+        alignment = _batch_matrix(
+            axis_align_matrix, points, points.shape[0], 'axis_align_matrix')
+        rotation = torch.bmm(alignment[:, :3, :3], pose[:, :3, :3])
+        if not torch.isfinite(rotation).all():
+            raise ValueError('scene-axis rotation must be finite')
+        return torch.einsum('bij,b...j->b...i', rotation, points.float())
+
+
 def _homogeneous_extrinsics(extrinsics):
     if extrinsics.ndim != 4:
         raise ValueError(

@@ -6,8 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from mmdet3d.structures.ops.iou3d_calculator import (
-    axis_aligned_bbox_overlaps_3d)
+from igdet.box_geometry import axis_aligned_iou
 
 
 def _corners(centers, sizes):
@@ -17,8 +16,9 @@ def _corners(centers, sizes):
 class InstanceQueryAggregator(nn.Module):
     """Retrieve at most one observation per other view for each scene anchor.
 
-    Matching uses aligned-scene boxes. Pooling uses the existing normalized
-    VGGT centers and aligned-axis extents, preserving the decoder's contract.
+    Matching uses scene-axis boxes in normalized units. Pooling uses the
+    existing normalized VGGT centers and aligned-axis extents, preserving the
+    decoder's contract.
     Anchors remain independent and may share support observations. All matching
     and pooled outputs are detached, as in the original query initializer.
     """
@@ -42,22 +42,22 @@ class InstanceQueryAggregator(nn.Module):
 
     @torch.no_grad()
     def forward(self, selected, observations, num_views,
-                anchor_centers_aligned, scene_scale):
+                anchor_centers_normalized):
         """Return selected fields plus support indices, masks and weights.
 
         ``selected`` is the NMS/FPS output. ``observations`` also contains the
-        aligned NMS geometry and raw instance embeddings. Anchor geometry is
-        supplied explicitly because an FPS anchor's center can differ from
+        normalized scene-axis IoU geometry and raw instance embeddings. Anchor
+        geometry is supplied explicitly because an FPS anchor's center can differ from
         its source observation's predicted center.
         """
         device = selected['detection_query'].device
         with torch.autocast(device_type=device.type, enabled=False):
             return self._aggregate(
                 selected, observations, num_views,
-                anchor_centers_aligned, scene_scale)
+                anchor_centers_normalized)
 
     def _aggregate(self, selected, observations, num_views,
-                   anchor_centers_aligned, scene_scale):
+                   anchor_centers_normalized):
         batch_size, anchor_count, dims = selected['detection_query'].shape
         valid_mask = observations['valid_mask']
         if num_views < 1 or valid_mask.shape[0] != batch_size * num_views:
@@ -66,13 +66,9 @@ class InstanceQueryAggregator(nn.Module):
         if query_count < 1:
             raise ValueError('observations require at least one query per view')
         count = num_views * query_count
-        device = selected['detection_query'].device
-        if anchor_centers_aligned.shape != (batch_size, anchor_count, 3):
-            raise ValueError('aligned anchor centers must have shape [B, K, 3]')
-        scale = torch.as_tensor(
-            scene_scale, device=device, dtype=torch.float32).reshape(batch_size)
-        if not torch.isfinite(scale).all() or (scale <= 0).any():
-            raise ValueError('scene scale must be finite and positive')
+        if anchor_centers_normalized.shape != (batch_size, anchor_count, 3):
+            raise ValueError(
+                'normalized scene-axis anchor centers must have shape [B, K, 3]')
         sources = selected['source_indices']
         if sources.shape != (batch_size, anchor_count) or \
                 ((sources < -1) | (sources >= count)).any():
@@ -89,8 +85,8 @@ class InstanceQueryAggregator(nn.Module):
             raise ValueError('observation and anchor feature dimensions differ')
         centers = scene_field('bbox_centers_vggt')
         sizes = scene_field('bbox_sizes_vggt')
-        aligned_centers = scene_field('nms_centers_aligned')
-        aligned_sizes = scene_field('nms_sizes_aligned')
+        iou_centers = scene_field('iou_centers_normalized')
+        iou_sizes = scene_field('iou_sizes_normalized')
         embeddings = scene_field('instance_embeddings')
         foreground = scene_field('class_scores_2d').amax(dim=-1)
         norms = embeddings.norm(dim=-1)
@@ -104,10 +100,10 @@ class InstanceQueryAggregator(nn.Module):
         candidate_valid &= valid_mask.reshape(batch_size, count).bool()
         candidate_valid &= usable_embeddings
         # Protect gather/pooling even if a caller supplies a broader mask.
-        for value in [queries, centers, sizes, aligned_centers, aligned_sizes]:
+        for value in [queries, centers, sizes, iou_centers, iou_sizes]:
             candidate_valid &= torch.isfinite(value).all(dim=-1)
         candidate_valid &= (sizes > 0).all(dim=-1)
-        candidate_valid &= (aligned_sizes > 0).all(dim=-1)
+        candidate_valid &= (iou_sizes > 0).all(dim=-1)
         candidate_valid &= torch.isfinite(foreground) & (foreground > 0)
 
         output = dict(selected)
@@ -132,19 +128,17 @@ class InstanceQueryAggregator(nn.Module):
                             & torch.isfinite(anchor_centers).all(dim=-1)
                             & torch.isfinite(anchor_sizes).all(dim=-1)
                             & torch.isfinite(anchor_queries).all(dim=-1)
-                            & torch.isfinite(anchor_centers_aligned[batch_id]).all(dim=-1)
+                            & torch.isfinite(anchor_centers_normalized[batch_id]).all(dim=-1)
                             & (anchor_sizes > 0).all(dim=-1))
             similarities = (normalized[batch_id, safe_sources]
                             @ normalized[batch_id, pool].t()).clamp(-1, 1)
             anchor_boxes = _corners(
-                anchor_centers_aligned[batch_id].float(),
-                anchor_sizes * scale[batch_id])
+                anchor_centers_normalized[batch_id].float(),
+                anchor_sizes)
             anchor_boxes = torch.where(anchor_valid[:, None], anchor_boxes, 0.)
             candidate_boxes = _corners(
-                aligned_centers[batch_id, pool], aligned_sizes[batch_id, pool])
-            ious = axis_aligned_bbox_overlaps_3d(
-                anchor_boxes, candidate_boxes, mode='iou',
-                is_aligned=False, eps=1e-6)
+                iou_centers[batch_id, pool], iou_sizes[batch_id, pool])
+            ious = axis_aligned_iou(anchor_boxes, candidate_boxes)
             different_view = (anchor_sources[:, None] // query_count
                               != pool[None] // query_count)
             matches = (anchor_valid[:, None] & different_view

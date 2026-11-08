@@ -10,7 +10,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from igdet.camera_alignment import (
     denormalize_vggt_boxes, denormalize_vggt_gt_points,
-    load_axis_aligned_points)
+    load_axis_aligned_points, rotate_vggt_points_to_scene_axes)
 from igdet.detr3_models.helpers import GenericMLP
 from igdet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from igdet.device import autocast, get_device
@@ -18,6 +18,7 @@ from igdet.feature_projection import VGGTDetectionPyramid, VGGTFeatureProjector
 from igdet.geometry_attention import GeometryAwareDeformableDecoder
 from igdet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from igdet.instance_aggregation import InstanceQueryAggregator
+from igdet.instance_prior_scale import InstancePriorScaleRecovery
 from igdet.query_correspondence import select_reconstruction_boxes
 from igdet.reconstruction_object_head import ReconstructionObjectHead
 from igdet.vggt_camera_loss import (
@@ -84,6 +85,7 @@ class IGDet(Base3DDetector):
             prediction_visualization_dir='work_dirs/igdet_visualizations',
             prediction_visualization_score_thr=0.1,
             two_d_retention_cfg=None,
+            ipmsr_cfg=None,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -243,6 +245,15 @@ class IGDet(Base3DDetector):
             output_use_activation=True,
             hidden_use_bias=True,
         )
+        self.ipmsr = None
+        if ipmsr_cfg is not None:
+            if self.train_2d_only:
+                raise ValueError('IP-MSR requires 3D detection')
+            if self.bbox_head.loss_layer_ids[-1] != self.bbox_head.n_levels - 1:
+                raise ValueError('IP-MSR EMA requires final detection-layer matches')
+            self.ipmsr = InstancePriorScaleRecovery(
+                classes=g_dino_cfg['semantic_classes'], embed_dims=token_dim,
+                **dict(ipmsr_cfg))
         self.if_mix_precision = if_mix_precision
         if gt_points_dir is None:
             raise ValueError('VGGT GT inverse alignment requires gt_points_dir')
@@ -390,13 +401,9 @@ class IGDet(Base3DDetector):
         with torch.no_grad(), autocast(images.device, enabled=False):
             extrinsics, intrinsics = encoding_to_camera(
                 pose_encoding.detach(), images.shape[-2:])
-        scene_scale = self._resolve_vggt_gt_scale(
-            batch_inputs_dict, batch_data_samples, images)
-
         intrinsics = intrinsics.float()
         if not torch.isfinite(intrinsics).all():
             raise FloatingPointError('VGGT intrinsics contain non-finite values')
-        batch_inputs_dict['vggt_gt_scale'] = scene_scale.detach()
         batch_inputs_dict['vggt_raw_extrinsics'] = extrinsics.detach()
         batch_inputs_dict['vggt_intrinsics'] = intrinsics.detach()
         del cached_tokens
@@ -416,25 +423,17 @@ class IGDet(Base3DDetector):
             'bbox_centers_vggt'].reshape(candidate_shape)
         candidate_sizes_vggt = reconstruction_outputs[
             'bbox_sizes_vggt'].reshape(candidate_shape)
-        candidate_centers_aligned = denormalize_vggt_gt_points(
+        candidate_centers_normalized = rotate_vggt_points_to_scene_axes(
             candidate_centers_vggt.detach(),
             batch_inputs_dict['pose_matrix'],
-            batch_inputs_dict['axis_align_matrix'],
-            batch_inputs_dict['vggt_gt_scale'])
-        scene_scale = torch.as_tensor(
-            batch_inputs_dict['vggt_gt_scale'], device=images.device,
-            dtype=torch.float32).reshape(batch_size)
+            batch_inputs_dict['axis_align_matrix'])
         selection_outputs = dict(reconstruction_outputs)
-        selection_outputs['nms_centers_aligned'] = (
-            candidate_centers_aligned.reshape(
+        selection_outputs['iou_centers_normalized'] = (
+            candidate_centers_normalized.reshape(
                 batch_size * num_views, query_count, 3))
-        selection_outputs['nms_sizes_aligned'] = (
-            candidate_sizes_vggt.detach()
-            * scene_scale[:, None, None, None]).reshape(
-                batch_size * num_views, query_count, 3)
-        selection_outputs['fallback_size_vggt'] = (
-            torch.ones(batch_size, 3, device=images.device) /
-            scene_scale[:, None])
+        selection_outputs['iou_sizes_normalized'] = (
+            candidate_sizes_vggt.detach().reshape(
+                batch_size * num_views, query_count, 3))
         selected = select_reconstruction_boxes(
             selection_outputs,
             batch_size=batch_size,
@@ -446,14 +445,13 @@ class IGDet(Base3DDetector):
                        for index, sample in enumerate(batch_data_samples)],
             foreground_score_thr=self.reconstruction_foreground_score_thr)
         if self.instance_aggregator is not None:
-            anchor_centers_aligned = denormalize_vggt_gt_points(
+            anchor_centers_normalized = rotate_vggt_points_to_scene_axes(
                 selected['query_xyz_vggt'][:, None].detach(),
                 batch_inputs_dict['pose_matrix'],
-                batch_inputs_dict['axis_align_matrix'],
-                batch_inputs_dict['vggt_gt_scale'])[:, 0]
+                batch_inputs_dict['axis_align_matrix'])[:, 0]
             selected = self.instance_aggregator(
                 selected, selection_outputs, num_views,
-                anchor_centers_aligned, scene_scale)
+                anchor_centers_normalized)
         candidate_centers_vggt = reconstruction_outputs[
             'bbox_centers_vggt'].reshape(
                 batch_size, num_views * query_count, 3)
@@ -530,6 +528,18 @@ class IGDet(Base3DDetector):
             self.query_projection,
             self.bbox_head.center_heads)
 
+    def _recover_scene_scale(self, box_features, normalized_outputs,
+                             feature_maps, batch_inputs_dict):
+        outputs = self.ipmsr(
+            box_features[-1].transpose(1, 2),
+            normalized_outputs['center_preds'][-1].transpose(1, 2),
+            normalized_outputs['size_preds'][-1].transpose(1, 2),
+            normalized_outputs['cls_preds'][-1].transpose(1, 2),
+            feature_maps, batch_inputs_dict['pose_matrix'],
+            batch_inputs_dict['axis_align_matrix'])
+        batch_inputs_dict['pred_scene_scale'] = outputs['scale']
+        return outputs
+
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
         if self.train_2d_only:
@@ -598,13 +608,26 @@ class IGDet(Base3DDetector):
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz_vggt, query,
             raw_extrinsics, intrinsics)
+        head_kwargs = {}
+        if self.ipmsr is not None:
+            normalized_outputs = self.bbox_head(
+                box_features, batch_inputs_dict, refined_query_xyz,
+                initial_query_sizes=query_size_vggt)
+            head_kwargs.update(normalized_outputs=normalized_outputs,
+                               return_matches=True)
         detection_losses = self.bbox_head.loss(
-            box_features,
-            batch_data_samples,
-            batch_inputs_dict,
+            box_features, batch_data_samples, batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
-            initial_query_sizes=query_size_vggt,
-            **kwargs)
+            initial_query_sizes=query_size_vggt, **head_kwargs, **kwargs)
+        if self.ipmsr is not None:
+            detection_losses, matches = detection_losses
+            scale_outputs = self._recover_scene_scale(
+                box_features, normalized_outputs, vggt_feature_maps,
+                batch_inputs_dict)
+            losses.update({f'ipmsr_{name}': value for name, value in
+                           self.ipmsr.loss(scale_outputs, batch_inputs_dict['vggt_gt_scale']).items()})
+            self.ipmsr.update_prototypes(
+                box_features[-1].transpose(1, 2), matches, batch_data_samples)
         losses.update({f'igdet_{name}': value
                        for name, value in detection_losses.items()})
 
@@ -648,13 +671,24 @@ class IGDet(Base3DDetector):
         box_features, refined_query_xyz = self.get_box_features(
             vggt_feature_maps, batch_inputs_dict, img, query_xyz_vggt, query,
             raw_extrinsics, intrinsics)
+        head_kwargs = {}
+        if self.ipmsr is not None:
+            normalized_outputs = self.bbox_head(
+                box_features, batch_inputs_dict, refined_query_xyz,
+                initial_query_sizes=query_size_vggt)
+            scale_outputs = self._recover_scene_scale(
+                box_features, normalized_outputs, vggt_feature_maps,
+                batch_inputs_dict)
+            head_kwargs.update(normalized_outputs=normalized_outputs,
+                               scene_scale=scale_outputs['scale'])
+        else:
+            # Preserve the baseline metric-recovery protocol when disabled.
+            batch_inputs_dict['vggt_gt_scale'] = self._resolve_vggt_gt_scale(
+                batch_inputs_dict, batch_data_samples, img).detach()
         results_list = self.bbox_head.predict(
-            box_features,
-            batch_data_samples,
-            batch_inputs_dict,
+            box_features, batch_data_samples, batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
-            initial_query_sizes=query_size_vggt,
-            **kwargs)
+            initial_query_sizes=query_size_vggt, **head_kwargs, **kwargs)
         if self.prediction_visualization:
             self._save_prediction_visualizations(
                 batch_data_samples, results_list, reconstruction_outputs,
@@ -663,6 +697,13 @@ class IGDet(Base3DDetector):
                 batch_inputs_dict=batch_inputs_dict)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
+        if self.ipmsr is not None:
+            for index, sample in enumerate(predictions):
+                sample.set_metainfo(dict(
+                    pred_scene_scale=float(scale_outputs['scale'][index].detach()),
+                    ipmsr_prior_scale=float(
+                        scale_outputs['prior_log_scale'][index].detach().exp()),
+                    ipmsr_topk_fallback=bool(scale_outputs['topk_fallback'][index])))
         return predictions
 
     @torch.no_grad()
@@ -682,7 +723,8 @@ class IGDet(Base3DDetector):
                 batch_inputs_dict['pose_matrix'], batch_index)[None]
             axis_align = self._matrix_item(
                 batch_inputs_dict['axis_align_matrix'], batch_index)[None]
-            scene_scales = batch_inputs_dict['vggt_gt_scale']
+            scene_scales = (batch_inputs_dict['pred_scene_scale']
+                            if self.ipmsr is not None else batch_inputs_dict['vggt_gt_scale'])
             scene_scale = scene_scales[batch_index:batch_index + 1]
             reconstruction_points = denormalize_vggt_gt_points(
                 diagnostics['reconstruction_points_vggt'][None, None],
@@ -761,4 +803,7 @@ class IGDet(Base3DDetector):
         results = self.bbox_head.forward(
             box_features, batch_inputs_dict, refined_query_xyz,
             initial_query_sizes=query_size_vggt)
+        if self.ipmsr is not None:
+            results['scale_outputs'] = self._recover_scene_scale(
+                box_features, results, vggt_feature_maps, batch_inputs_dict)
         return results
