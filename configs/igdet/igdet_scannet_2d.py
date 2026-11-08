@@ -28,16 +28,6 @@ _decoder_layer_num = 4
 model = dict(
     type='IGDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
-    vggt_lora_cfg=dict(
-        enabled=True,
-        block_indices=[3, 4, 10, 11, 16, 17, 22, 23],
-        branches=['frame_blocks', 'inter_frame_blocks'],
-        target_modules=['attn.qkv', 'attn.proj'],
-        rank=8,
-        alpha=16,
-        dropout=0.0,
-        gradient_checkpointing=True,
-        checkpoint_start_block=3),
     detection_pyramid_cfg=dict(out_channels=256, norm_groups=32),
     g_dino_cfg=dict(
         cross_view_checkpointing=True,
@@ -320,3 +310,6 @@ default_hooks = dict(
 )
 
 find_unused_parameters = True
+
+# Keep the new frozen-backbone pretraining separate from old adapter runs.
+work_dir = 'work_dirs/igdet_scannet_2d_frozen_vggt'

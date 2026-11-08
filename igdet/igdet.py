@@ -23,14 +23,11 @@ from igdet.reconstruction_object_head import ReconstructionObjectHead
 from igdet.vggt_camera_loss import (
     compute_vggt_camera_loss, VGGT_CAMERA_LOSS_DEFAULTS)
 from igdet.vggt_ground_truth import mean_point_distance, transform_points
-from igdet.vggt_lora import (
-    configure_vggt_lora, enable_lora_parameters,
-    log_vggt_lora_summary, vggt_feature_grad_context)
 from igdet.prediction_visualization import (
     save_scene_reconstruction_visualizations)
 from igdet.visualization_colors import CLASS_COLORS
-from igdet.two_d_retention import (
-    read_2d_checkpoint, restore_vggt_2d_components, scale_retention_losses)
+from igdet.two_d_checkpoint import (
+    read_2d_checkpoint, restore_detection_pyramid)
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
@@ -62,7 +59,6 @@ class IGDet(Base3DDetector):
             position_embedding="fourier",
             if_mix_precision=False,
             vggt_omega_checkpoint=None,
-            vggt_lora_cfg=None,
             detection_pyramid_cfg=None,
             deformable_num_points=4,
             reconstruction_nms_cfg=None,
@@ -83,25 +79,11 @@ class IGDet(Base3DDetector):
             prediction_visualization=False,
             prediction_visualization_dir='work_dirs/igdet_visualizations',
             prediction_visualization_score_thr=0.1,
-            two_d_retention_cfg=None,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.train_2d_only = bool(train_2d_only)
-        self.two_d_retention_cfg = dict(two_d_retention_cfg or {})
-        self.retain_2d = bool(self.two_d_retention_cfg)
-        if self.retain_2d:
-            if self.train_2d_only or not (supervise_2d_bbox and supervise_instance_consistency):
-                raise ValueError('2D retention requires 3D training with both 2D losses enabled')
-            unknown = set(self.two_d_retention_cfg) - {'checkpoint', 'detection_weight'}
-            if unknown or not self.two_d_retention_cfg.get('checkpoint'):
-                raise ValueError('2D retention requires checkpoint and optional detection_weight')
-            scale_retention_losses({}, float(self.two_d_retention_cfg.get('detection_weight', 1.0)))
         self.use_vggt_2d_features = detection_pyramid_cfg is not None
-        if self.retain_2d and not self.use_vggt_2d_features:
-            raise ValueError('2D retention requires detection_pyramid_cfg')
-        if self.use_vggt_2d_features and not (self.train_2d_only or self.retain_2d):
-            raise ValueError('VGGT 2D features require pretraining or joint 2D retention')
 
         bbox_head.update(train_cfg=train_cfg)
         bbox_head.update(test_cfg=test_cfg)
@@ -125,19 +107,16 @@ class IGDet(Base3DDetector):
                     'Unknown camera_loss_cfg keys: '
                     f'{sorted(unknown_keys)}')
             self.camera_loss_cfg.update(camera_loss_cfg)
-        self.vggt_lora_summary = configure_vggt_lora(
-            self.vggt_encoder.aggregator, vggt_lora_cfg)
-        log_vggt_lora_summary(self.vggt_lora_summary, vggt_lora_cfg)
-        self.vggt_lora_enabled = bool(
-            self.vggt_lora_summary.replaced_modules)
         self._configure_vggt_trainability(training=self.training)
 
-        retention_state = None
-        if self.retain_2d:
-            retention_state = read_2d_checkpoint(
-                self.two_d_retention_cfg['checkpoint'], vggt_lora_cfg,
-                g_dino_cfg['semantic_classes'], detection_pyramid_cfg,
-                scene_query_exchange_cfg)
+        pretrained_2d_state = None
+        if not self.train_2d_only:
+            pretrained_2d_state = read_2d_checkpoint(
+                g_dino_cfg['grounding_dino_checkpoint'],
+                classes=g_dino_cfg['semantic_classes'],
+                pyramid_cfg=detection_pyramid_cfg,
+                exchange_cfg=scene_query_exchange_cfg,
+                backbone_checkpoint=vggt_omega_checkpoint)
 
         # gdino encoder
         self.semantic_encoder = GroundingDINOSemanticEncoder(
@@ -146,21 +125,20 @@ class IGDet(Base3DDetector):
             classes=g_dino_cfg['semantic_classes'],
             cross_view_checkpointing=g_dino_cfg.get(
                 'cross_view_checkpointing', True),
-            supervise_2d_bbox=supervise_2d_bbox,
+            supervise_2d_bbox=(self.train_2d_only and supervise_2d_bbox),
             pretrain_2d_only=self.train_2d_only,
             reconstruction_depth_loss_weight=(
                 reconstruction_depth_loss_weight),
             reconstruction_point_loss_weight=(
                 reconstruction_point_loss_weight),
             supervise_instance_consistency=(
-                supervise_instance_consistency),
+                self.train_2d_only and supervise_instance_consistency),
             instance_consistency_cfg=instance_consistency_cfg,
             scene_query_exchange_cfg=scene_query_exchange_cfg,
             supervise_confident_query_depth=(
                 supervise_confident_query_depth),
             confident_query_depth_cfg=confident_query_depth_cfg,
-            freeze_2d_modules=self.retain_2d,
-            pretrained_state_dict=retention_state)
+            pretrained_state_dict=pretrained_2d_state)
         semantic_query_dims = self.semantic_encoder.model.embed_dims
         reconstruction_query_dims = resolve_reconstruction_query_dims(
             self.semantic_encoder)
@@ -201,14 +179,14 @@ class IGDet(Base3DDetector):
                 'ExternalFeatureBackbone and 2D detection_pyramid_cfg '
                 'must be enabled together')
 
-        if self.retain_2d:
+        if not self.train_2d_only:
             if self.semantic_encoder.model.reconstruction_decoder is None:
                 raise ValueError('Joint training must preserve the 3D reconstruction decoder')
-            restore_vggt_2d_components(
-                self.vggt_encoder, self.detection_feature_projector, retention_state)
+            restore_detection_pyramid(
+                self.detection_feature_projector, pretrained_2d_state)
             self.detection_feature_projector.requires_grad_(False)
             self.detection_feature_projector.eval()
-        del retention_state
+        del pretrained_2d_state
 
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
@@ -275,11 +253,6 @@ class IGDet(Base3DDetector):
     def _configure_vggt_trainability(self, training):
         self.vggt_encoder.requires_grad_(False)
         self.vggt_encoder.eval()
-        if self.train_2d_only and not self.use_vggt_2d_features:
-            return
-        if self.vggt_lora_enabled:
-            enable_lora_parameters(self.vggt_encoder.aggregator)
-            self.vggt_encoder.aggregator.train(bool(training))
         if self.train_2d_only:
             return
         camera_head = self.vggt_encoder.camera_head
@@ -291,14 +264,13 @@ class IGDet(Base3DDetector):
         self._configure_vggt_trainability(training=mode)
         if self.train_2d_only:
             self._configure_2d_pretrain_trainability()
-        elif self.retain_2d:
+        else:
             self.detection_feature_projector.eval()
         return self
 
     def extract_feat(self, batch_inputs_dict: dict,
                      batch_data_samples: SampleList, mode):
-        keep_graph = self.training and self.vggt_lora_enabled
-        with vggt_feature_grad_context(keep_graph):
+        with torch.no_grad():
             # The data preprocessor converts raw BGR uint8 images to RGB without
             # normalization. VGGT-Omega expects RGB values in [0, 1].
             img = batch_inputs_dict['imgs'].float().div(255.0)
@@ -554,7 +526,7 @@ class IGDet(Base3DDetector):
                 vggt_token_list, ps_idx, img, batch_inputs_dict,
                 batch_data_samples, return_pose_encoding=True))
         feature_kwargs = {}
-        if self.retain_2d:
+        if self.use_vggt_2d_features:
             feature_kwargs['external_img_feats'] = self.detection_feature_projector(
                 vggt_token_list, img, ps_idx)
         semantic_losses, _, reconstruction_outputs = (
@@ -569,9 +541,6 @@ class IGDet(Base3DDetector):
                     batch_inputs_dict['gt_depth_valid_masks']),
                 vggt_gt_scale=batch_inputs_dict['vggt_gt_scale'],
                 return_reconstruction=True, **feature_kwargs))
-        if self.retain_2d:
-            semantic_losses = scale_retention_losses(
-                semantic_losses, float(self.two_d_retention_cfg.get('detection_weight', 1.0)))
         losses = {f'gdino_{name}': value
                   for name, value in semantic_losses.items()}
         if self.supervise_camera_head:
@@ -630,7 +599,7 @@ class IGDet(Base3DDetector):
             vggt_token_list, ps_idx, img, batch_inputs_dict,
             batch_data_samples)
         feature_kwargs = {}
-        if self.retain_2d:
+        if self.use_vggt_2d_features:
             feature_kwargs['external_img_feats'] = self.detection_feature_projector(
                 vggt_token_list, img, ps_idx)
         reconstruction_outputs, _ = (
@@ -739,7 +708,7 @@ class IGDet(Base3DDetector):
             batch_data_samples)
 
         feature_kwargs = {}
-        if self.retain_2d:
+        if self.use_vggt_2d_features:
             feature_kwargs['external_img_feats'] = self.detection_feature_projector(
                 vggt_token_list, img, ps_idx)
         reconstruction_outputs, _ = (

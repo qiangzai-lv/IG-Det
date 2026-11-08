@@ -16,7 +16,7 @@ gt_points_dir = f'{data_root}/points'
 vggt_omega_checkpoint = 'data/pretrain/vggt_omega_1b_512.pt'
 
 grounding_dino_config = 'configs/gdino/grounding_dino_vggt_joint_scannet.py'
-grounding_dino_checkpoint = 'data/pretrain/2d_sem_weight/epoch_1.pth'
+grounding_dino_checkpoint = 'work_dirs/igdet_scannet_2d_frozen_vggt/epoch_1.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -28,21 +28,8 @@ _decoder_layer_num = 4
 model = dict(
     type='IGDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
-    vggt_lora_cfg=dict(
-        enabled=True,
-        block_indices=[3, 4, 10, 11, 16, 17, 22, 23],
-        branches=['frame_blocks', 'inter_frame_blocks'],
-        target_modules=['attn.qkv', 'attn.proj'],
-        rank=8,
-        alpha=16,
-        dropout=0.0,
-        gradient_checkpointing=True,
-        checkpoint_start_block=3),
     # Must be a complete VGGT 2D checkpoint containing the detection pyramid.
     detection_pyramid_cfg=dict(out_channels=256, norm_groups=32),
-    two_d_retention_cfg=dict(
-        checkpoint=grounding_dino_checkpoint,
-        detection_weight=0.1),
     g_dino_cfg=dict(
         grounding_dino_config=grounding_dino_config,
         grounding_dino_checkpoint=grounding_dino_checkpoint,
@@ -70,9 +57,9 @@ model = dict(
         max_supports=8,
         anchor_weight=0.5),
     gt_points_dir=gt_points_dir,
-    supervise_2d_bbox=True,
+    supervise_2d_bbox=False,
     train_2d_only=False,
-    supervise_instance_consistency=True,
+    supervise_instance_consistency=False,
     instance_consistency_cfg=dict(
         embedding_dims=128,
         temperature=0.1,

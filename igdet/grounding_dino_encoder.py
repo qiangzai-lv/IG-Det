@@ -13,7 +13,7 @@ from mmdet.models.dense_heads.atss_vlfusion_head import (
     convert_grounding_to_cls_scores)
 from mmdet.structures import DetDataSample
 from mmdet.utils import register_all_modules
-from igdet.two_d_retention import is_2d_detector_state, require_complete_state
+from igdet.two_d_checkpoint import is_2d_detector_state, require_complete_state
 
 
 def extract_grounding_dino_state_dict(state_dict):
@@ -82,7 +82,6 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  supervise_confident_query_depth: bool = False,
                  confident_query_depth_cfg=None,
                  cross_view_checkpointing: bool = True,
-                 freeze_2d_modules: bool = False,
                  pretrained_state_dict=None) -> None:
         super().__init__()
         if not isinstance(cross_view_checkpointing, bool):
@@ -90,13 +89,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
         self.classes = tuple(classes)
-        self.supervise_2d_bbox = bool(supervise_2d_bbox)
         self.pretrain_2d_only = bool(pretrain_2d_only)
-        self.freeze_2d_modules = bool(freeze_2d_modules)
-        if self.freeze_2d_modules and self.pretrain_2d_only:
-            raise ValueError('Cannot freeze the detector during 2D pretraining')
-        self.supervise_instance_consistency = bool(
-            supervise_instance_consistency)
+        self.freeze_2d_modules = not self.pretrain_2d_only
+        self.supervise_2d_bbox = self.pretrain_2d_only and bool(supervise_2d_bbox)
+        self.supervise_instance_consistency = (
+            self.pretrain_2d_only and bool(supervise_instance_consistency))
         self.use_scene_query_exchange = bool(
             scene_query_exchange_cfg
             and scene_query_exchange_cfg.get('enabled', True))
@@ -151,7 +148,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         if (self.freeze_2d_modules and query_weight is not None and
                 query_weight.shape != self.model.query_embedding.weight.shape):
             raise ValueError(
-                'Frozen 2D retention requires the same query count/dimensions '
+                'Frozen 2D detector requires the same query count/dimensions '
                 'as its 2D pretrained detector')
         if (query_weight is not None and
                 query_weight.shape != self.model.query_embedding.weight.shape and
@@ -199,22 +196,6 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 self.model.reconstruction_decoder.requires_grad_(False)
             self.model.bbox_head.reconstruction_head.requires_grad_(False)
             return
-        self.model.requires_grad_(False)
-        if self.supervise_2d_bbox or self.supervise_instance_consistency:
-            for module in (self.model.query_embedding, self.model.decoder,
-                           self.model.bbox_head):
-                module.requires_grad_(True)
-        scene_query_exchange = getattr(
-            self.model, 'scene_query_exchange', None)
-        if (scene_query_exchange is not None
-                and (self.supervise_2d_bbox
-                     or self.supervise_instance_consistency)):
-            scene_query_exchange.requires_grad_(True)
-        reconstruction_decoder = self.model.reconstruction_decoder
-        if reconstruction_decoder is not None and not self.pretrain_2d_only:
-            reconstruction_decoder.requires_grad_(True)
-        self.model.bbox_head.reconstruction_head.requires_grad_(
-            not self.pretrain_2d_only)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -233,25 +214,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 self.model.reconstruction_decoder.eval()
             self.model.bbox_head.reconstruction_head.eval()
             return self
-        if not (self.supervise_2d_bbox
-                or self.supervise_instance_consistency):
-            # GroundingDINO checks its root ``training`` flag to construct
-            # the encoder/denoising metadata consumed by bbox_head.loss.
-            # Keep that control flow while all frozen detector children stay
-            # in eval mode.
-            for module in self.model.children():
-                module.eval()
-            reconstruction_decoder = self.model.reconstruction_decoder
-            if reconstruction_decoder is not None:
-                reconstruction_decoder.train(mode)
-            self.model.bbox_head.reconstruction_head.train(mode)
-            return self
-        for module_name in ('backbone', 'neck', 'encoder', 'language_model',
-                            'text_feat_map'):
-            module = getattr(self.model, module_name, None)
-            if module is not None:
-                module.eval()
-        return self
+
 
     def _ensure_token_positive_map(self):
         if (self.token_positive_map is not None

@@ -6,7 +6,6 @@
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
@@ -79,8 +78,6 @@ class Aggregator(nn.Module):
         self.depth = depth
         self.patch_size = patch_size
         self.cached_layer_indices = set(cached_layer_indices)
-        self.gradient_checkpointing = False
-        self.checkpoint_start_block = 0
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
         self.patch_token_start = 1 + num_register_tokens
@@ -143,47 +140,13 @@ class Aggregator(nn.Module):
 
     def _run_block_pair(self, tokens, batch_size, num_frames, num_tokens,
                         embed_dim, block_idx, frame_rope):
-        def run(block_tokens):
-            block_tokens, frame_tokens = self._run_frame_block(
-                block_tokens,
-                batch_size,
-                num_frames,
-                num_tokens,
-                embed_dim,
-                block_idx,
-                frame_rope,
-            )
-            block_tokens = self._run_inter_frame_attention_block(
-                block_tokens,
-                batch_size,
-                num_frames,
-                num_tokens,
-                embed_dim,
-                block_idx,
-                self.inter_frame_attention_types[block_idx],
-            )
-            return block_tokens, frame_tokens
-
-        if self._should_checkpoint_block(block_idx):
-            return checkpoint(run, tokens, use_reentrant=False)
-        return run(tokens)
-
-    def configure_gradient_checkpointing(self, enabled: bool,
-                                         start_block: int = 0) -> None:
-        if (not isinstance(start_block, int) or isinstance(start_block, bool)
-                or start_block < 0 or start_block >= self.depth):
-            raise ValueError(
-                f'checkpoint_start_block must be in [0, {self.depth})')
-        self.gradient_checkpointing = bool(enabled)
-        self.checkpoint_start_block = start_block
-
-    def _should_checkpoint_block(self, block_idx: int) -> bool:
-        return (
-            self.gradient_checkpointing
-            and self.training
-            and torch.is_grad_enabled()
-            and block_idx >= self.checkpoint_start_block
-        )
+        tokens, frame_tokens = self._run_frame_block(
+            tokens, batch_size, num_frames, num_tokens, embed_dim,
+            block_idx, frame_rope)
+        tokens = self._run_inter_frame_attention_block(
+            tokens, batch_size, num_frames, num_tokens, embed_dim,
+            block_idx, self.inter_frame_attention_types[block_idx])
+        return tokens, frame_tokens
 
     def _run_frame_block(
         self,
