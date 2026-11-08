@@ -733,12 +733,6 @@ def convert(args: argparse.Namespace) -> None:
         payload = pickle.load(handle)
     validate_categories(payload)
     data_list = payload['data_list']
-    for index, info in enumerate(data_list, 1):
-        if index == 1 or index % 10 == 0 or index == len(data_list):
-            LOGGER.info('Worker %d/%d validating scene %d/%d: %s',
-                        args.shard_id, args.num_shards, index, len(data_list),
-                        _scene_id(info))
-        validate_scene(info)
     if len({_scene_id(info) for info in data_list}) != len(data_list):
         raise ValueError('duplicate scene IDs')
     if args.max_scenes >= 0:
@@ -809,6 +803,9 @@ def convert(args: argparse.Namespace) -> None:
         coco['info']['generation'] = generation
         rejections = []
         image_id = annotation_id = 1
+        LOGGER.info('Worker %d/%d validating assigned scene %d/%d: %s',
+                    args.shard_id, args.num_shards, worker_offset + 1,
+                    len(selected_scenes), scene_id)
         points = load_scene_points(root, info)
         objects, _ = _prepare_objects(info, points, category_by_label)
         rng = np.random.default_rng(args.seed + scene_index)

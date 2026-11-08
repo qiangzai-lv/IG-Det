@@ -54,7 +54,7 @@ def validate_scene(info: dict) -> None:
     seen = set()
     path_parts = Path(info['img_paths'][0]).parts
     split = path_parts[2] if len(path_parts) > 2 else ''
-    for rgb, depth, intrinsic, pose in zip(info['img_paths'], info['depth_paths'], info['cam2img'], info['lidar2cam']):
+    for rgb, depth in zip(info['img_paths'], info['depth_paths']):
         rgb, depth = Path(rgb), Path(depth)
         if (rgb.is_absolute() or depth.is_absolute() or '..' in rgb.parts or '..' in depth.parts
                 or len(rgb.parts) != 5 or rgb.parts[:2] != ('processed', '3dod')
@@ -65,15 +65,19 @@ def validate_scene(info: dict) -> None:
         if str(rgb) in seen:
             raise ValueError(f'{scene}: duplicate image path: {rgb}')
         seen.add(str(rgb))
-        k, t = np.asarray(intrinsic), np.asarray(pose)
-        if (k.shape != (3, 3) or not np.isfinite(k).all() or k[0, 0] <= 0 or k[1, 1] <= 0
-                or not np.allclose(k[2], [0, 0, 1], atol=1e-6)):
-            raise ValueError(f'{scene}: invalid camera intrinsic')
-        if (t.shape != (4, 4) or not np.isfinite(t).all()
-                or not np.allclose(t[3], [0, 0, 0, 1], atol=1e-6)
-                or not np.allclose(t[:3, :3].T @ t[:3, :3], np.eye(3), atol=1e-4)
-                or not np.isclose(np.linalg.det(t[:3, :3]), 1, atol=1e-4)):
-            raise ValueError(f'{scene}: invalid rigid C2W pose')
+    # Batch camera checks avoid thousands of small NumPy calls per scene.
+    k = np.asarray(info['cam2img'])
+    t = np.asarray(info['lidar2cam'])
+    if (k.shape != (count, 3, 3) or not np.isfinite(k).all()
+            or (k[:, 0, 0] <= 0).any() or (k[:, 1, 1] <= 0).any()
+            or not np.allclose(k[:, 2], [0, 0, 1], atol=1e-6)):
+        raise ValueError(f'{scene}: invalid camera intrinsic')
+    if (t.shape != (count, 4, 4) or not np.isfinite(t).all()
+            or not np.allclose(t[:, 3], [0, 0, 0, 1], atol=1e-6)
+            or not np.allclose(t[:, :3, :3].transpose(0, 2, 1) @ t[:, :3, :3],
+                               np.eye(3), atol=1e-4)
+            or not np.isclose(np.linalg.det(t[:, :3, :3]), 1, atol=1e-4).all()):
+        raise ValueError(f'{scene}: invalid rigid C2W pose')
     ids = []
     for index, instance in enumerate(info['instances']):
         box = np.asarray(instance['bbox_3d'])
