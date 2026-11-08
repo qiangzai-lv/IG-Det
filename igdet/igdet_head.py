@@ -14,7 +14,7 @@ from igdet.detr3_models.helpers import GenericMLP
 from mmdet.utils import reduce_mean
 from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
-from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
+from igdet.rotated_geometry import pack_boxes, rotated_overlaps, rotated_nms
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
 from igdet.camera_alignment import denormalize_vggt_boxes
@@ -84,9 +84,11 @@ class IGDetHead(BaseModule):
                  loss_layer_ids=None,
                  gt_repeat_num=5,
                  size_logit_range=(-10.0, 10.0),
+                 yaw_weight=0.5,
                  ):
         super(IGDetHead, self).__init__(init_cfg)
         self.n_classes = n_classes
+        self.yaw_weight = float(yaw_weight)
         self.n_levels = n_levels
         self.n_reg_outs = n_reg_outs
         self.pts_assign_threshold = pts_assign_threshold
@@ -146,6 +148,8 @@ class IGDetHead(BaseModule):
             input_dim=n_channels)
         size_head = size_mlp_func(output_dim=3)
         semcls_head = self.mlp_func(output_dim=n_classes)
+        # Same scalar scene-yaw head at every decoder layer, as VGGT-Det.
+        self.yaw_head = self.mlp_func(output_dim=1)
         self.center_heads = nn.ModuleList([
             copy.deepcopy(center_head) for _ in range(n_levels)
         ])
@@ -182,11 +186,13 @@ class IGDetHead(BaseModule):
         center_preds = []
         size_residual_preds = []
         cls_preds = []
+        yaw_preds = []
         for feature, center, layer_id in zip(
                 x, refined_query_xyz, layer_ids):
             center_preds.append(center.permute(0, 2, 1))
             size_residual_preds.append(self.size_heads[layer_id](feature))
             cls_preds.append(self.semcls_heads[layer_id](feature))
+            yaw_preds.append(self.yaw_head(feature).float())
         with torch.autocast(device_type=size_residual_preds[0].device.type,
                             enabled=False):
             size_reference_logs, size_log_preds, size_preds = (
@@ -200,7 +206,7 @@ class IGDetHead(BaseModule):
             size_residual_preds=size_residual_preds,
             size_reference_logs=size_reference_logs,
             size_log_preds=size_log_preds,
-            cls_preds=cls_preds)
+            cls_preds=cls_preds, yaw_preds=yaw_preds)
 
     @staticmethod
     def _align_detection_outputs(outputs, batch_inputs_dict):
@@ -258,7 +264,7 @@ class IGDetHead(BaseModule):
 
         loss_inputs = (
                        outputs['center_preds'], outputs['size_preds'],
-                       outputs['size_log_preds'], outputs['cls_preds'], layer_ids,
+                       outputs['size_log_preds'], outputs['cls_preds'], outputs['yaw_preds'], layer_ids,
                        batch_gt_instances_3d, batch_input_metas,
                        batch_input_points, batch_gt_instances_ignore)
         losses = self.loss_by_feat(*loss_inputs)
@@ -269,6 +275,7 @@ class IGDetHead(BaseModule):
                      size_preds: List[List[Tensor]],
                      size_log_preds: List[List[Tensor]],
                      cls_preds: List[List[Tensor]],
+                     yaw_preds: List[List[Tensor]],
                      layer_ids: List[int],
                      #  objness_preds: List[List[Tensor]],
                      batch_gt_instances_3d: InstanceList,
@@ -286,6 +293,7 @@ class IGDetHead(BaseModule):
             size_losses = []
             cls_losses = []
             giou_losses = []
+            yaw_losses = []
             matches = []
             for batch_id in range(len(batch_input_metas)):
                 gt_bboxes = batch_gt_instances_3d[batch_id].bboxes_3d
@@ -297,18 +305,20 @@ class IGDetHead(BaseModule):
                     cls_preds[layer_id][batch_id].t(),
                     gt_bboxes.gravity_center,
                     gt_sizes,
-                    batch_gt_instances_3d[batch_id].labels_3d))
+                    batch_gt_instances_3d[batch_id].labels_3d,
+                    yaw_preds[layer_id][batch_id].t(), gt_bboxes.tensor[:,6]))
             local_num_pos = sum(match[0].numel() for match in matches)
             avg_factor = reduce_mean(center_preds[layer_id][0].new_tensor(
                 [local_num_pos], dtype=torch.float32)).clamp_min(1.0).item()
 
             for batch_id in range(len(batch_input_metas)):
-                center_loss, size_loss, cls_loss, giou_loss = \
+                center_loss, size_loss, cls_loss, giou_loss, yaw_loss = \
                     self._loss_by_feat_single(
                         center_pred=center_preds[layer_id][batch_id],
                         size_pred=size_preds[layer_id][batch_id],
                         size_log_pred=size_log_preds[layer_id][batch_id],
                         cls_pred=cls_preds[layer_id][batch_id],
+                        yaw_pred=yaw_preds[layer_id][batch_id],
                         input_meta=batch_input_metas[batch_id],
                         gt_bboxes=batch_gt_instances_3d[
                             batch_id].bboxes_3d,
@@ -321,11 +331,13 @@ class IGDetHead(BaseModule):
                 size_losses.append(size_loss)
                 cls_losses.append(cls_loss)
                 giou_losses.append(giou_loss)
+                yaw_losses.append(yaw_loss)
             losses_by_layer.append((layer_id, dict(
                 center_loss=torch.sum(torch.stack(center_losses)),
                 size_loss=torch.sum(torch.stack(size_losses)),
                 cls_loss=torch.sum(torch.stack(cls_losses)),
-                giou_loss=torch.sum(torch.stack(giou_losses)))))
+                giou_loss=torch.sum(torch.stack(giou_losses)),
+                yaw_loss=torch.sum(torch.stack(yaw_losses)))))
 
         loss_dict = {}
         main_layer_id = layer_ids[-1]
@@ -336,7 +348,7 @@ class IGDetHead(BaseModule):
         return loss_dict
 
     def _loss_by_feat_single(self, center_pred, size_pred,
-                             size_log_pred, cls_pred, input_meta,
+                             size_log_pred, cls_pred, yaw_pred, input_meta,
                              gt_bboxes, gt_labels, input_points,
                              match_indices=None, avg_factor=None):
         del input_meta, input_points
@@ -349,7 +361,7 @@ class IGDetHead(BaseModule):
         if match_indices is None:
             pred_indices, gt_indices = self.matcher._get_targets(
                 centers, sizes, size_logs, cls_scores,
-                gt_centers, gt_sizes, gt_labels)
+                gt_centers, gt_sizes, gt_labels, yaw_pred.t(), gt_bboxes.tensor[:,6])
         else:
             pred_indices, gt_indices = match_indices
         if avg_factor is None:
@@ -381,17 +393,18 @@ class IGDetHead(BaseModule):
                 centers[pred_indices], gt_centers[gt_indices],
                 reduction='sum') / avg_factor
 
-            pred_tp_bbox = self._center_size_pred_to_bbox(
-                centers[pred_indices], sizes[pred_indices])
-            gt_tp_bbox = self._center_size_pred_to_bbox(
-                gt_centers[gt_indices], gt_sizes[gt_indices])
-            giou = axis_aligned_bbox_overlaps_3d(
-                pred_tp_bbox.unsqueeze(0), gt_tp_bbox.unsqueeze(0),
-                mode='giou', is_aligned=True)
+            pred_boxes = pack_boxes(centers[pred_indices], sizes[pred_indices], yaw_pred.t()[pred_indices])
+            gt_boxes = pack_boxes(gt_centers[gt_indices], gt_sizes[gt_indices], gt_bboxes.tensor[gt_indices,6])
+            giou = rotated_overlaps(pred_boxes, gt_boxes, mode='giou', aligned=True)
             giou_loss = (1.0 - giou).sum() / avg_factor
         center_loss = center_loss * self.loss_weights['center_loss']
         giou_loss = giou_loss * self.loss_weights['iou_loss']
-        return center_loss, size_loss, cls_loss, giou_loss
+        if pred_indices.numel() == 0:
+            yaw_loss = yaw_pred.sum()*0.
+        else:
+            yaw_loss = F.mse_loss(yaw_pred.t()[pred_indices,0],
+                                  gt_bboxes.tensor[gt_indices,6], reduction='sum') / avg_factor
+        return center_loss, size_loss, cls_loss, giou_loss, yaw_loss*self.yaw_weight
 
     def predict(self,
                 x: Tuple[Tensor],
@@ -411,6 +424,7 @@ class IGDetHead(BaseModule):
             [outputs['center_preds'][-1]],
             [outputs['size_preds'][-1]],
             [outputs['cls_preds'][-1]],
+            [outputs['yaw_preds'][-1]],
             batch_input_metas=batch_input_metas,
             rescale=rescale, batch_inputs_dict=batch_inputs_dict, batch_data_samples=batch_data_samples)
         return predictions
@@ -418,6 +432,7 @@ class IGDetHead(BaseModule):
     def predict_by_feat(self, center_preds: List[List[Tensor]],
                         size_preds: List[List[Tensor]],
                         cls_preds: List[List[Tensor]],
+                        yaw_preds: List[List[Tensor]],
                         batch_input_metas: List[dict], batch_inputs_dict: dict, batch_data_samples,
                         **kwargs) -> List[InstanceData]:
 
@@ -432,18 +447,20 @@ class IGDetHead(BaseModule):
                     center_preds=[x[i] for x in center_preds],
                     size_preds=[x[i] for x in size_preds],
                     cls_preds=[x[i] for x in cls_preds],
+                    yaw_preds=[x[i] for x in yaw_preds],
                     input_meta=batch_input_metas[i],
                     input_points=batch_input_points[i],
                     data_samples=batch_data_samples[i]))
         return results
 
-    def _predict_by_feat_single(self, center_preds, size_preds, cls_preds,
+    def _predict_by_feat_single(self, center_preds, size_preds, cls_preds, yaw_preds,
                                 input_meta: dict, input_points, data_samples) -> InstanceData:
 
         mlvl_bboxes, mlvl_scores = [], []
         for stage_idx in range(len(center_preds)):
             centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
                 stage_idx].t()
+            angles = yaw_preds[stage_idx].t()
             scores = cls_scores.sigmoid()
 
             max_scores, _ = scores.max(dim=1)
@@ -453,7 +470,8 @@ class IGDetHead(BaseModule):
                 centers = centers[ids]
                 sizes = sizes[ids]
                 scores = scores[ids]
-            bboxes = self._center_size_pred_to_bbox(centers, sizes)
+                angles = angles[ids]
+            bboxes = pack_boxes(centers, sizes, angles)
             mlvl_bboxes.append(bboxes)
             mlvl_scores.append(scores)
 
@@ -463,7 +481,7 @@ class IGDetHead(BaseModule):
                                                      input_meta)  # bboxes(n_box, 6) (x_center, y_center, z_center, w, h, z)
 
         bboxes = input_meta['box_type_3d'](
-            bboxes_after_nms, box_dim=6, with_yaw=False, origin=(.5, .5, .5))
+            bboxes_after_nms, box_dim=7, with_yaw=True, origin=(.5, .5, .5))
 
         results = InstanceData()
         results.bboxes_3d = bboxes
@@ -472,75 +490,17 @@ class IGDetHead(BaseModule):
 
         return results
 
-    def find_max_iou_from_center_size_boxes(self, boxes1, boxes2):
-        boxes1_tp = self._center_size_pred_to_bbox(boxes1[:, :3], boxes1[:, 3:6])
-        boxes2_tp = self._center_size_pred_to_bbox(boxes2[:, :3], boxes2[:, 3:6])
-        giou_2 = axis_aligned_bbox_overlaps_3d(boxes1_tp.unsqueeze(0), boxes2_tp.unsqueeze(0), mode='giou')  # giou
-        giou_max_gt, max_gt_box_idx = torch.max(giou_2, axis=2)
-        max_giou, max_pred_box_idx = torch.max(giou_max_gt, axis=1)
-        assert max_giou <= 1 and max_giou >= -1
-        return max_giou, max_gt_box_idx, max_pred_box_idx
-
-    def _center_size_pred_to_bbox(self, centers, sizes):
-        return torch.stack([
-            centers[:, 0] - sizes[:, 0] / 2.0, centers[:, 1] - sizes[:, 1] / 2.0,
-            centers[:, 2] - sizes[:, 2] / 2.0, centers[:, 0] + sizes[:, 0] / 2.0,
-            centers[:, 1] + sizes[:, 1] / 2.0, centers[:, 2] + sizes[:, 2] / 2.0
-        ], -1)
-
-    def _nms(self, bboxes, scores, img_meta):  # bbox is 6-dim. (x_min, y_min, z_min, x_max, y_max, z_max)
-        scores, labels = scores.max(dim=1)
-        ids = scores > self.test_cfg.score_thr
-        bboxes = bboxes[ids]
-        scores = scores[ids]
-        labels = labels[ids]
-        ids = self.aligned_3d_nms(bboxes, scores, labels,
-                                  self.test_cfg.iou_thr)
-        bboxes = bboxes[ids]
-        bboxes = torch.stack(
-            ((bboxes[:, 0] + bboxes[:, 3]) / 2.,
-             (bboxes[:, 1] + bboxes[:, 4]) / 2.,
-             (bboxes[:, 2] + bboxes[:, 5]) / 2., bboxes[:, 3] - bboxes[:, 0],
-             bboxes[:, 4] - bboxes[:, 1], bboxes[:, 5] - bboxes[:, 2]),
-            dim=1)  # (convert to (x_center, y_center, z_center, w, h, z))
-        return bboxes, scores[ids], labels[ids]
-
-    @staticmethod
-    def aligned_3d_nms(boxes, scores, classes, thresh):
-
-        x1 = boxes[:, 0]
-        y1 = boxes[:, 1]
-        z1 = boxes[:, 2]
-        x2 = boxes[:, 3]
-        y2 = boxes[:, 4]
-        z2 = boxes[:, 5]
-        area = (x2 - x1) * (y2 - y1) * (z2 - z1)
-        zero = boxes.new_zeros(1, )
-
-        score_sorted = torch.argsort(scores)
-        pick = []
-        while (score_sorted.shape[0] != 0):
-            last = score_sorted.shape[0]
-            i = score_sorted[-1]
-            pick.append(i)
-
-            xx1 = torch.max(x1[i], x1[score_sorted[:last - 1]])
-            yy1 = torch.max(y1[i], y1[score_sorted[:last - 1]])
-            zz1 = torch.max(z1[i], z1[score_sorted[:last - 1]])
-            xx2 = torch.min(x2[i], x2[score_sorted[:last - 1]])
-            yy2 = torch.min(y2[i], y2[score_sorted[:last - 1]])
-            zz2 = torch.min(z2[i], z2[score_sorted[:last - 1]])
-            classes1 = classes[i]
-            classes2 = classes[score_sorted[:last - 1]]
-            inter_l = torch.max(zero, xx2 - xx1)
-            inter_w = torch.max(zero, yy2 - yy1)
-            inter_h = torch.max(zero, zz2 - zz1)
-
-            inter = inter_l * inter_w * inter_h
-            iou = inter / (area[i] + area[score_sorted[:last - 1]] - inter)
-            iou = iou * (classes1 == classes2).float()
-            score_sorted = score_sorted[torch.nonzero(
-                iou <= thresh, as_tuple=False).flatten()]
-
-        indices = boxes.new_tensor(pick, dtype=torch.long)
-        return indices
+    def _nms(self, bboxes, scores, img_meta):
+        # Reference VGGT-Det runs NMS separately for every foreground class;
+        # one proposal may consequently produce more than one class prediction.
+        del img_meta
+        output_boxes, output_scores, output_labels = [], [], []
+        for label in range(scores.shape[1]):
+            mask = scores[:,label] > self.test_cfg.score_thr
+            boxes, values = bboxes[mask], scores[mask,label]
+            labels = torch.full_like(values, label, dtype=torch.long)
+            keep = rotated_nms(boxes, values, labels, self.test_cfg.iou_thr, bev=True)
+            output_boxes.append(boxes[keep])
+            output_scores.append(values[keep])
+            output_labels.append(labels[keep])
+        return torch.cat(output_boxes), torch.cat(output_scores), torch.cat(output_labels)

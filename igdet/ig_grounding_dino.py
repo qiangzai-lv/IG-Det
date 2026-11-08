@@ -30,7 +30,7 @@ class ExternalFeatureBackbone(nn.Module):
 class IGGroundingDINO(GroundingDINO):
 
     def __init__(self, *args, reconstruction_decoder=None,
-                 scene_query_exchange_cfg=None, **kwargs):
+                 scene_query_exchange_cfg=None, freeze_modules=(), **kwargs):
         super().__init__(*args, **kwargs)
         self.reconstruction_decoder = None
         if reconstruction_decoder is not None:
@@ -54,6 +54,22 @@ class IGGroundingDINO(GroundingDINO):
                     SceneQueryExchange(embed_dims=self.embed_dims, **cfg)
                     for _ in range(self.decoder.num_layers)
                 ])
+
+        # Consume the project freeze policy here; stock MMDetection does not
+        # accept freeze_modules in DetectionTransformer.__init__.
+        self.freeze_modules = tuple(freeze_modules)
+        self._freeze_configured_modules()
+
+    def _freeze_configured_modules(self):
+        for name in self.freeze_modules:
+            module = self.get_submodule(name)
+            module.requires_grad_(False)
+            module.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self._freeze_configured_modules()
+        return self
 
     @contextmanager
     def _using_external_img_feats(self, feature_maps):

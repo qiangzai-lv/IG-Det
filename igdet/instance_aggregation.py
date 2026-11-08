@@ -6,19 +6,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from mmdet3d.structures.ops.iou3d_calculator import (
-    axis_aligned_bbox_overlaps_3d)
-
-
-def _corners(centers, sizes):
-    return torch.cat([centers - sizes / 2, centers + sizes / 2], dim=-1)
-
+from igdet.rotated_geometry import pack_boxes, rotated_overlaps
 
 class InstanceQueryAggregator(nn.Module):
     """Retrieve at most one observation per other view for each scene anchor.
 
     Matching uses aligned-scene boxes. Pooling uses the existing normalized
-    VGGT centers and aligned-axis extents, preserving the decoder's contract.
+    VGGT centers and body-axis dimensions, preserving the decoder's contract.
     Anchors remain independent and may share support observations. All matching
     and pooled outputs are detached, as in the original query initializer.
     """
@@ -91,6 +85,7 @@ class InstanceQueryAggregator(nn.Module):
         sizes = scene_field('bbox_sizes_vggt')
         aligned_centers = scene_field('nms_centers_aligned')
         aligned_sizes = scene_field('nms_sizes_aligned')
+        yaws = scene_field('bbox_yaw_aligned')
         embeddings = scene_field('instance_embeddings')
         foreground = scene_field('class_scores_2d').amax(dim=-1)
         norms = embeddings.norm(dim=-1)
@@ -104,7 +99,7 @@ class InstanceQueryAggregator(nn.Module):
         candidate_valid &= valid_mask.reshape(batch_size, count).bool()
         candidate_valid &= usable_embeddings
         # Protect gather/pooling even if a caller supplies a broader mask.
-        for value in [queries, centers, sizes, aligned_centers, aligned_sizes]:
+        for value in [queries, centers, sizes, aligned_centers, aligned_sizes, yaws]:
             candidate_valid &= torch.isfinite(value).all(dim=-1)
         candidate_valid &= (sizes > 0).all(dim=-1)
         candidate_valid &= (aligned_sizes > 0).all(dim=-1)
@@ -136,15 +131,14 @@ class InstanceQueryAggregator(nn.Module):
                             & (anchor_sizes > 0).all(dim=-1))
             similarities = (normalized[batch_id, safe_sources]
                             @ normalized[batch_id, pool].t()).clamp(-1, 1)
-            anchor_boxes = _corners(
+            anchor_boxes = pack_boxes(
                 anchor_centers_aligned[batch_id].float(),
-                anchor_sizes * scale[batch_id])
-            anchor_boxes = torch.where(anchor_valid[:, None], anchor_boxes, 0.)
-            candidate_boxes = _corners(
-                aligned_centers[batch_id, pool], aligned_sizes[batch_id, pool])
-            ious = axis_aligned_bbox_overlaps_3d(
-                anchor_boxes, candidate_boxes, mode='iou',
-                is_aligned=False, eps=1e-6)
+                anchor_sizes * scale[batch_id], selected['query_yaw_aligned'][batch_id])
+            anchor_boxes = torch.where(anchor_valid[:, None], anchor_boxes,
+                                       anchor_boxes.new_tensor([0,0,0,1,1,1,0]))
+            candidate_boxes = pack_boxes(
+                aligned_centers[batch_id,pool], aligned_sizes[batch_id,pool], yaws[batch_id,pool])
+            ious = rotated_overlaps(anchor_boxes, candidate_boxes)
             different_view = (anchor_sources[:, None] // query_count
                               != pool[None] // query_count)
             matches = (anchor_valid[:, None] & different_view

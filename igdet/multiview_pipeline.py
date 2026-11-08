@@ -4,7 +4,7 @@ import numpy as np
 from mmcv.transforms import BaseTransform, Compose
 
 from mmdet3d.registry import TRANSFORMS
-from .scannet_multiview_dataset import build_view_2d_instances
+from .arkitscenes_multiview_dataset import build_view_2d_instances
 from .vggt_ground_truth import load_and_resize_depth
 
 
@@ -44,12 +44,11 @@ def read_pose_matrix(file_path):
 @TRANSFORMS.register_module()
 class LoadFirstFramePose(BaseTransform):
     def transform(self, results: dict) -> dict:
-        first_img_path = results['img_path'][0]
-        pose_matrix = read_pose_matrix(str(Path(first_img_path).with_suffix('.txt')))
-        if pose_matrix is None:
-            raise ValueError(f'Could not load first-frame pose for {first_img_path}')
-
-        results['pose_matrix'] = pose_matrix.astype(np.float32)
+        # The first sampled view need not be frame zero. C2W comes from the
+        # exact same selection as RGB/depth, including evaluation without depth.
+        index = int(results['view_indices'][0])
+        results['pose_matrix'] = np.asarray(
+            results['lidar2cam'][index], dtype=np.float32).copy()
         return results
 
 

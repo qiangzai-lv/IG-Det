@@ -1,53 +1,6 @@
 import numpy as np
 import torch
-from mmdet3d.structures.ops.iou3d_calculator import (
-    axis_aligned_bbox_overlaps_3d)
-
-
-@torch.no_grad()
-def _aligned_3d_nms(centers, sizes, scores, classes, threshold):
-    """Class-aware volume NMS using device-native PyTorch AABB overlaps.
-
-    Keep the legacy ascending-argsort/reverse traversal, including score ties.
-    Compute IoUs in row chunks and perform greedy suppression on CPU masks,
-    avoiding a device synchronization for every selected box. Only geometry and
-    indices participate; query features stay on their original device.
-    Geometry is float32; retain the previous 1e-6 union-volume clamp. The
-    axis-aligned formula has no rotated-BEV intersection tolerance.
-    """
-    if centers.shape[0] == 0:
-        return centers.new_empty((0,), dtype=torch.long)
-    order = scores.argsort().flip(0)
-    # Use the same min/max convention as final detection NMS. Convert before
-    # computing corners so half/bfloat16 inputs do not lose more precision.
-    centers = centers.float()
-    half_sizes = sizes.float() / 2.0
-    boxes = torch.cat([
-        centers - half_sizes, centers + half_sizes
-    ], dim=-1)[order].contiguous()
-    sorted_classes = classes[order].cpu().numpy()
-    kept = np.zeros(len(centers), dtype=np.bool_)
-    for label in np.unique(sorted_classes):
-        positions = np.flatnonzero(sorted_classes == label)
-        class_boxes = boxes[torch.as_tensor(positions, device=boxes.device)]
-        count = len(positions)
-        suppression = np.empty((count, count), dtype=np.bool_)
-        # Bound float32 IoU intermediates, even if all 8192 candidates agree
-        # on the class (as happens at initialization).
-        for start in range(0, count, 512):
-            stop = min(start + 512, count)
-            iou = axis_aligned_bbox_overlaps_3d(
-                class_boxes[start:stop], class_boxes, mode='iou',
-                is_aligned=False, eps=1e-6)
-            suppression[start:stop] = (iou > threshold).cpu().numpy()
-        suppressed = np.zeros(count, dtype=np.bool_)
-        for index in range(count):
-            if not suppressed[index]:
-                kept[positions[index]] = True
-                suppressed |= suppression[index]
-
-    keep_positions = torch.as_tensor(np.flatnonzero(kept), device=order.device)
-    return order[keep_positions]
+from igdet.rotated_geometry import pack_boxes, rotated_nms
 
 
 def _weighted_fps(points, scores, selected_points, count):
@@ -95,10 +48,10 @@ def select_reconstruction_boxes(
         reconstruction_outputs, batch_size, num_views, num_queries,
         nms_iou_thr, logger, scene_ids=None,
         foreground_score_thr=0.1):
-    """Select fixed-count scene proposals from reconstruction AABBs."""
+    """Select fixed-count scene proposals from reconstructed scene OBBs."""
     per_query_keys = (
         'bbox_centers_vggt', 'bbox_sizes_vggt', 'bbox_scores',
-        'bbox_labels', 'class_scores_2d', 'fused_detection_query',
+        'bbox_labels', 'bbox_yaw_aligned', 'class_scores_2d', 'fused_detection_query',
         'points_vggt', 'valid_mask', 'nms_centers_aligned',
         'nms_sizes_aligned')
     required = per_query_keys + ('fallback_size_vggt',)
@@ -145,6 +98,8 @@ def select_reconstruction_boxes(
     valid = valid_mask.reshape(
         batch_size, num_views * query_count).bool().clone()
 
+    yaw = reconstruction_outputs['bbox_yaw_aligned'].reshape(batch_size, -1, 1)
+    valid &= torch.isfinite(yaw).all(dim=-1)
     valid &= torch.isfinite(centers).all(dim=-1)
     valid &= torch.isfinite(sizes).all(dim=-1)
     valid &= torch.isfinite(nms_centers).all(dim=-1)
@@ -158,6 +113,7 @@ def select_reconstruction_boxes(
     valid &= foreground_scores_2d >= foreground_score_thr
     fallback_valid = valid_mask.reshape(
         batch_size, num_views * query_count).bool().clone()
+    fallback_valid &= torch.isfinite(yaw).all(dim=-1)
     fallback_valid &= torch.isfinite(sizes).all(dim=-1)
     fallback_valid &= (sizes > 0).all(dim=-1)
     fallback_valid &= torch.isfinite(queries).all(dim=-1)
@@ -176,9 +132,10 @@ def select_reconstruction_boxes(
             valid[batch_id], as_tuple=False).flatten()
         candidate_scores = scores[batch_id, candidate_indices].detach()
         if candidate_indices.numel():
-            local_keep = _aligned_3d_nms(
-                nms_centers[batch_id, candidate_indices].detach(),
-                nms_sizes[batch_id, candidate_indices].detach(),
+            local_keep = rotated_nms(
+                pack_boxes(nms_centers[batch_id, candidate_indices],
+                           nms_sizes[batch_id, candidate_indices],
+                           yaw[batch_id, candidate_indices]).detach(),
                 candidate_scores,
                 labels[batch_id, candidate_indices].detach(), nms_iou_thr)
             local_keep = local_keep[candidate_scores[local_keep].argsort(
@@ -280,7 +237,11 @@ def select_reconstruction_boxes(
         output_source_indices.append(source_indices)
         output_fallback_masks.append(fallback_mask)
 
+    all_sources = torch.stack(output_source_indices)
+    query_yaw = yaw.gather(1, all_sources.clamp_min(0)[..., None])
+    query_yaw = torch.where((all_sources >= 0)[..., None] & torch.isfinite(query_yaw), query_yaw, 0.).detach()
     return {
+        'query_yaw_aligned': query_yaw,
         'query_xyz_vggt': torch.stack(output_centers),
         'query_size_vggt': torch.stack(output_sizes),
         'detection_query': torch.stack(output_queries),

@@ -1,7 +1,7 @@
 from .data_preprocessor import IGDetDataPreprocessor
 from .formating import PackNeRFDetInputs
 from .multiview_pipeline import LoadFirstFramePose, MultiViewPipeline
-from .scannet_multiview_dataset import MultiViewScanNetDataset
+from .arkitscenes_multiview_dataset import MultiViewARKitDataset
 from .vggt_ground_truth import BuildVGGTGroundTruth
 from .igdet import IGDet
 from .igdet_head import IGDetHead
@@ -12,7 +12,7 @@ from .ig_grounding_dino import IGGroundingDINO
 
 
 __all__ = [
-    'MultiViewScanNetDataset',
+    'MultiViewARKitDataset',
     'LoadFirstFramePose', 'MultiViewPipeline', 'BuildVGGTGroundTruth',
     'PackNeRFDetInputs',
     'IGDet', 'IGDetDataPreprocessor', 'IGDetHead', 'IGGroundingDINO',

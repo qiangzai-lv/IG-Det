@@ -1,4 +1,4 @@
-"""Export box-selected ScanNet instance PLYs and depth-tested RGB projections.
+"""Export box-selected ARKitScenes instance PLYs and depth-tested RGB projections.
 
 Uses exactly the point assignment and visibility routines of the 2D annotation
 generator. It does not filter instances by the annotation acceptance threshold.
@@ -21,10 +21,10 @@ from PIL import Image, ImageDraw
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from utils.scannet_3d_to_coco_bbox import (  # noqa: E402
+from utils.arkitscenes_3d_to_coco_bbox import (  # noqa: E402
     GeneratorConfig, VISIBLE, OCCLUDED, UNKNOWN, _PALETTE,
-    _aabb_corners, _AABB_EDGES, _build_view_geometry, _prepare_objects,
-    _scene_id, camera_matrix_for_view, load_axis_aligned_scene_points,
+    _obb_corners, _OBB_EDGES, _build_view_geometry, _prepare_objects,
+    _scene_id, camera_matrix_for_view, load_scene_points,
     load_depth_map, sample_view_indices,
     world_to_camera_from_aligned_pose,
 )
@@ -50,7 +50,7 @@ def category_color(label):
 def ply_header(count, edge_count=None):
     header = (
         'ply\nformat binary_little_endian 1.0\n'
-        'comment coordinates: axis-aligned ScanNet world, metres\n'
+        'comment coordinates: axis-aligned ARKitScenes world, metres\n'
         f'element vertex {count}\n'
         'property float x\nproperty float y\nproperty float z\n'
         'property uchar red\nproperty uchar green\nproperty uchar blue\n'
@@ -98,10 +98,10 @@ def export_clouds(output, points, objects):
     with (output / 'scene_boxes.ply').open('wb') as handle:
         handle.write(ply_header(8 * len(objects), 12 * len(objects)))
         for obj in objects:
-            vertices(_aabb_corners(obj.box), obj).tofile(handle)
+            vertices(_obb_corners(obj.box), obj).tofile(handle)
         edges = np.empty(12 * len(objects), dtype=edge_dtype)
         for index in range(len(objects)):
-            for offset, (first, second) in enumerate(_AABB_EDGES):
+            for offset, (first, second) in enumerate(_OBB_EDGES):
                 edges[index * 12 + offset] = (index * 8 + first, index * 8 + second)
         edges.tofile(handle)
     return records
@@ -164,7 +164,7 @@ def projection(root, info, points, objects, view_index, output, config, radius,
     intrinsic = camera_matrix_for_view(info['cam2img'], view_index)
     geometry = _build_view_geometry(
         points, w2c, intrinsic, width, height,
-        load_depth_map(root, relative, config.depth_scale), config)
+        load_depth_map(root, info['depth_paths'][view_index], config.depth_scale), config)
     all_indices, all_colors, statistics = [], [], []
     for obj in objects:
         indices = obj.point_indices
@@ -242,9 +242,9 @@ def write_scene_index(output, summary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--data-root', default='data/ScanNet_processed_v2')
-    parser.add_argument('--ann-file', default='scannet_infos_train_mvod_with_ids.pkl')
-    parser.add_argument('--ann-file-2d', default='data/scannet_coco_v2/keypoints_bbox_train.json',
+    parser.add_argument('--data-root', default='data/ARKitScenes_processed')
+    parser.add_argument('--ann-file', default='arkit_infos_train_with_ids.pkl')
+    parser.add_argument('--ann-file-2d', default='data/arkitscenes_coco/bbox_train.json',
                         help='Saved COCO training boxes; relative to repository root')
     parser.add_argument('--output-dir', default='work_dirs/train_instance_points')
     parser.add_argument('--scene-id', nargs='+', help='Optional scene IDs; default: all training scenes')
@@ -304,7 +304,7 @@ def main():
         scene_output = output / scene_id
         # A fresh directory prevents stale PLYs / views from mixing across runs.
         scene_output.mkdir(exist_ok=False)
-        points = load_axis_aligned_scene_points(root, info)
+        points = load_scene_points(root, info)
         objects, _ = _prepare_objects(info, points, categories)
         LOGGER.info('[%d/%d] %s: %d points, %d instances',
                     index + 1, len(scenes), scene_id, len(points), len(objects))
@@ -320,7 +320,7 @@ def main():
         summary = dict(scene_id=scene_id, annotation_file=str(ann),
                        annotation_file_2d=str(ann_2d), box_source='Saved COCO bbox, no recomputation',
                        max_images_per_scene=views_per_scene,
-                       point_selection='3D AABB points with unique ownership; overlaps prefer greater intersection/own-volume ratio (smaller box); no annotation rejection filter',
+                       point_selection='3D OBB points with unique ownership; overlaps prefer greater intersection/own-volume ratio (smaller box); no annotation rejection filter',
                        gray='OCCLUDED and UNKNOWN; only in-image projections are drawn',
                        config=vars(args), instances=records, views=views)
         (scene_output / 'summary.json').write_text(

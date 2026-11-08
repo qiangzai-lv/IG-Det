@@ -79,7 +79,7 @@ def denormalize_vggt_gt_points(points, first_frame_pose, axis_align_matrix,
 
 def aligned_boxes_to_vggt(centers, sizes, first_frame_pose,
                           axis_align_matrix, scene_scale):
-    """Normalize aligned box centers and axis-aligned size targets."""
+    """Normalize scene box centers and body-axis lengths; yaw stays in scene space."""
     if centers.ndim != 2 or centers.shape[-1] != 3:
         raise ValueError('box centers must have shape [G, 3]')
     if sizes.shape != centers.shape:
@@ -104,7 +104,7 @@ def aligned_boxes_to_vggt(centers, sizes, first_frame_pose,
 
 def denormalize_vggt_boxes(centers, sizes, first_frame_pose,
                            axis_align_matrix, scene_scale):
-    """Align centers and restore axis-aligned size targets to metric scale."""
+    """Align centers and restore body-axis lengths to metres; do not rotate lengths."""
     if centers.ndim < 3 or centers.shape[-1] != 3:
         raise ValueError('box centers must have shape [B, ..., 3]')
     if sizes.shape != centers.shape:

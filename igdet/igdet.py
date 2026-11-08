@@ -478,16 +478,19 @@ class IGDet(Base3DDetector):
             reconstruction_labels=foreground_labels_2d[index].detach(),
             boxes_before_nms_vggt=torch.cat([
                 candidate_centers_vggt[index][valid],
-                candidate_sizes_vggt[index][valid]], dim=-1).detach(),
+                candidate_sizes_vggt[index][valid],
+                reconstruction_outputs['bbox_yaw_aligned'].reshape(batch_size,-1,1)[index][valid]], dim=-1).detach(),
             labels_before_nms=reconstruction_outputs['bbox_labels'].reshape(
                 batch_size, num_views * query_count)[index][valid].detach(),
             boxes_after_nms_vggt=torch.cat([
                 selected['query_xyz_vggt'][index][real],
-                selected['query_size_vggt'][index][real]], dim=-1).detach(),
+                selected['query_size_vggt'][index][real],
+                selected['query_yaw_aligned'][index][real]], dim=-1).detach(),
             labels_after_nms=selected['labels'][index][real].detach(),
             fallback_boxes_vggt=torch.cat([
                 selected['query_xyz_vggt'][index][fallback],
-                selected['query_size_vggt'][index][fallback]], dim=-1).detach()))
+                selected['query_size_vggt'][index][fallback],
+                selected['query_yaw_aligned'][index][fallback]], dim=-1).detach()))
         return selected
 
     def _predict_reconstruction_objects(self, reconstruction_outputs):
@@ -693,7 +696,7 @@ class IGDet(Base3DDetector):
                 centers, sizes = denormalize_vggt_boxes(
                     boxes[None, :, :3], boxes[None, :, 3:6],
                     pose, axis_align, scene_scale)
-                return torch.cat([centers[0], sizes[0]], dim=-1)
+                return torch.cat([centers[0], sizes[0], boxes[:,6:7]], dim=-1)
 
             boxes_before_nms = align_diagnostic_boxes(
                 'boxes_before_nms_vggt')

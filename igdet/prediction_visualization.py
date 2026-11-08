@@ -23,13 +23,15 @@ _DEFAULT_CLASS_COLORS = {
 }
 
 
-def _corners(center, size):
+def _corners(center, size, yaw=0.):
     signs = np.array([
         [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
         [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1]],
         dtype=np.float32)
-    return np.asarray(center, dtype=np.float32) + signs * (
-        np.asarray(size, dtype=np.float32) / 2.0)
+    c, s = np.cos(yaw), np.sin(yaw)
+    rotation = np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
+    return np.asarray(center, dtype=np.float32) + (signs * (
+        np.asarray(size, dtype=np.float32) / 2.0)) @ rotation.T
 
 
 def _line(a, b, step=0.03):
@@ -38,8 +40,8 @@ def _line(a, b, step=0.03):
     return np.linspace(a, b, count, dtype=np.float32)
 
 
-def _append_box(parts, colors, center, size, color, step):
-    corners = _corners(center, size)
+def _append_box(parts, colors, center, size, color, step, yaw=0.):
+    corners = _corners(center, size, yaw)
     for a, b in _EDGES:
         points = _line(corners[a], corners[b], step)
         parts.append(points)
@@ -69,6 +71,7 @@ def _colored_box_overlay(path, gt_boxes, gt_labels, boxes, labels,
     parts, colors = [], []
     gt_centers, gt_sizes = _box_center_size(gt_boxes)
     raw_boxes = _tensor(boxes)
+    gt_yaws, pred_yaws = _box_yaw(gt_boxes), _box_yaw(boxes)
     if raw_boxes.size:
         box_centers, box_sizes = _box_center_size(boxes)
         boxes = np.concatenate((box_centers, box_sizes), axis=1)
@@ -77,12 +80,12 @@ def _colored_box_overlay(path, gt_boxes, gt_labels, boxes, labels,
     labels = _tensor(labels).reshape(-1).astype(np.int64)
     if len(boxes) != len(labels):
         raise ValueError('boxes and labels must have the same length')
-    for center, size, label in zip(gt_centers, gt_sizes, _tensor(gt_labels).reshape(-1)):
+    for center, size, label, yaw in zip(gt_centers, gt_sizes, _tensor(gt_labels).reshape(-1), gt_yaws):
         color = class_colors.get(int(label), (150, 150, 150))
-        _append_box(parts, colors, center, size, color, box_line_step)
-    for center, size, label in zip(boxes[:, :3], boxes[:, 3:6], labels):
+        _append_box(parts, colors, center, size, color, box_line_step, yaw)
+    for center, size, label, yaw in zip(boxes[:, :3], boxes[:, 3:6], labels, pred_yaws):
         color = class_colors.get(int(label), (150, 150, 150))
-        _append_box(parts, colors, center, size, color, box_line_step)
+        _append_box(parts, colors, center, size, color, box_line_step, yaw)
     if not parts:
         parts.append(np.empty((0, 3), np.float32)); colors.append(np.empty((0, 3), np.uint8))
     write_binary_ply(path, np.concatenate(parts), np.concatenate(colors))
@@ -120,7 +123,7 @@ def save_scene_reconstruction_visualizations(
     stages = (
         ('boxes_before_nms', reconstruction_boxes_before_nms, reconstruction_labels_before_nms),
         ('boxes_after_nms', reconstruction_boxes_after_nms, reconstruction_labels_after_nms),
-        ('fallback_boxes', fallback_boxes, np.full((len(_tensor(fallback_boxes).reshape(-1, 6)),), -1)),
+        ('fallback_boxes', fallback_boxes, np.full((len(_tensor(fallback_boxes)),), -1)),
         ('final_detection', final_boxes, final_labels),
     )
     for name, boxes, labels in stages:
@@ -140,6 +143,11 @@ def _tensor(value):
     return np.asarray(value)
 
 
+def _box_yaw(boxes):
+    tensor = _tensor(boxes)
+    return tensor[:,6] if tensor.shape[1] == 7 else np.zeros(len(tensor))
+
+
 def _box_center_size(boxes):
     gravity_center = getattr(boxes, 'gravity_center', None)
     if gravity_center is not None:
@@ -153,25 +161,6 @@ def _box_center_size(boxes):
     if centers.ndim != 2 or centers.shape[0] != tensor.shape[0]:
         raise ValueError('3D box centers must have shape [N, 3]')
     return centers, tensor[:, 3:6]
-
-
-def transform_aabb_boxes(boxes, axis_align_matrix):
-    """Transform raw axis-aligned boxes and re-AABB them in aligned space."""
-    centers, sizes = _box_center_size(boxes)
-    matrix = np.asarray(axis_align_matrix, dtype=np.float32)
-    if matrix.shape != (4, 4):
-        raise ValueError('axis_align_matrix must have shape [4, 4]')
-    transformed = []
-    for center, size in zip(centers, sizes):
-        corners = _corners(center, size)
-        corners = corners @ matrix[:3, :3].T + matrix[:3, 3]
-        minimum = corners.min(axis=0)
-        maximum = corners.max(axis=0)
-        transformed.append(np.concatenate(((minimum + maximum) / 2,
-                                           maximum - minimum)))
-    if not transformed:
-        return np.empty((0, 6), dtype=np.float32)
-    return np.asarray(transformed, dtype=np.float32)
 
 
 def save_scene_prediction_visualization(
@@ -205,10 +194,10 @@ def save_scene_prediction_visualization(
     pred_sizes = pred_sizes[pred_keep]
     pred_scores = pred_scores[pred_keep]
     pred_labels = pred_labels[pred_keep]
-    for center, size in zip(gt_centers, gt_sizes):
-        _append_box(parts, colors, center, size, (40, 220, 70), box_line_step)
-    for center, size in zip(pred_centers, pred_sizes):
-        _append_box(parts, colors, center, size, (230, 40, 40), box_line_step)
+    for center, size, yaw in zip(gt_centers, gt_sizes, _box_yaw(gt_boxes)):
+        _append_box(parts, colors, center, size, (40, 220, 70), box_line_step, yaw)
+    for center, size, yaw in zip(pred_centers, pred_sizes, _box_yaw(pred_boxes)[pred_keep]):
+        _append_box(parts, colors, center, size, (230, 40, 40), box_line_step, yaw)
     recon = _tensor(reconstruction_points).reshape(-1, 3)
     scores = _tensor(reconstruction_scores).reshape(-1)
     keep = np.isfinite(recon).all(axis=1) & np.isfinite(scores)

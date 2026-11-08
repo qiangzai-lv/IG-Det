@@ -43,7 +43,7 @@ def mean_point_distance(points):
 def normalize_aligned_geometry_to_first_camera(
         points_aligned, selected_c2w_aligned,
         scale_points_aligned=None):
-    """Normalize aligned ScanNet geometry like VGGT training targets."""
+    """Normalize aligned ARKitScenes geometry like VGGT training targets."""
     c2w = np.asarray(selected_c2w_aligned, dtype=np.float64)
     if c2w.ndim != 3 or c2w.shape[1:] != (4, 4) or len(c2w) == 0:
         raise ValueError('selected_c2w_aligned must have shape [V, 4, 4]')
@@ -180,7 +180,7 @@ class BuildVGGTGroundTruth(BaseTransform):
             if not image_paths:
                 raise ValueError('Cannot determine scene id for VGGT GT')
             scene_id = Path(image_paths[0]).parent.name
-        point_path = self.points_root / f'{scene_id}.bin'
+        point_path = Path(results['lidar_path'])
         raw = np.fromfile(point_path, dtype=np.float32)
         if raw.size == 0 or raw.size % self.num_point_features:
             raise ValueError(f'Unexpected point cloud shape in {point_path}')

@@ -10,8 +10,7 @@ from torch import Tensor
 
 from igdet.camera_alignment import (
     aligned_boxes_to_vggt, denormalize_vggt_boxes)
-from mmdet3d.structures.ops.iou3d_calculator import (
-    axis_aligned_bbox_overlaps_3d)
+from igdet.rotated_geometry import pack_boxes, rotated_overlaps
 
 
 def supervised_instance_contrastive_loss(
@@ -49,10 +48,6 @@ def supervised_instance_contrastive_loss(
     return per_anchor[valid_anchors].mean()
 
 
-def _center_size_to_minmax(centers: Tensor, sizes: Tensor) -> Tensor:
-    half_sizes = sizes / 2.0
-    return torch.cat([centers - half_sizes, centers + half_sizes], dim=-1)
-
 
 class ReconstructionObjectHead(nn.Module):
     """Predict one VGGT-frame 3D box for every reconstruction query."""
@@ -63,6 +58,7 @@ class ReconstructionObjectHead(nn.Module):
             temperature: float = 0.07, instance_weight: float = 0.2,
             cls_weight: float = 1.0, center_weight: float = 0.5,
             size_weight: float = 1.0, giou_weight: float = 0.5,
+            yaw_weight: float = 0.5,
             size_epsilon: float = 1e-5,
             cls_loss: dict = dict(
                 type='mmdet.FocalLoss', use_sigmoid=True, gamma=2.0,
@@ -80,6 +76,7 @@ class ReconstructionObjectHead(nn.Module):
         self.center_weight = float(center_weight)
         self.size_weight = float(size_weight)
         self.giou_weight = float(giou_weight)
+        self.yaw_weight = float(yaw_weight)
         self.size_epsilon = float(size_epsilon)
         self.cls_loss = MODELS.build(cls_loss)
 
@@ -92,6 +89,7 @@ class ReconstructionObjectHead(nn.Module):
         self.instance_projection = prediction_head(instance_dims)
         self.center_offset_head = prediction_head(3)
         self.size_head = prediction_head(3)
+        self.yaw_head = prediction_head(1)
         self.semantic_projection = nn.Linear(semantic_dims, query_dims)
         self.class_fusion_norm = nn.LayerNorm(query_dims)
         self.class_head = prediction_head(num_classes)
@@ -125,6 +123,7 @@ class ReconstructionObjectHead(nn.Module):
             'bbox_center_offsets_vggt': center_offsets,
             'bbox_centers_vggt': points_vggt.float() + center_offsets,
             'bbox_sizes_vggt': sizes,
+            'bbox_yaw_aligned': self.yaw_head(queries_3d_fp32).float(),
             'bbox_logits': logits,
             'bbox_scores': scores,
             'bbox_labels': labels,
@@ -154,6 +153,7 @@ class ReconstructionObjectHead(nn.Module):
             dtype=torch.long, device=device)
         bbox_centers = logits.new_zeros(num_flat_views, num_queries, 3)
         bbox_sizes = logits.new_zeros(num_flat_views, num_queries, 3)
+        bbox_yaw = logits.new_zeros(num_flat_views, num_queries, 1)
         bbox_centers_aligned = logits.new_zeros(
             num_flat_views, num_queries, 3)
         bbox_sizes_aligned = logits.new_zeros(
@@ -191,7 +191,7 @@ class ReconstructionObjectHead(nn.Module):
             scene_targets.append((id_to_index, duplicate_ids,
                                   missing_id_field, labels_3d,
                                   centers_vggt, sizes_vggt,
-                                  centers_aligned, sizes_aligned))
+                                  centers_aligned, sizes_aligned, gt_3d.bboxes_3d.tensor[:,6].to(device)))
 
         for flat_view, (query_indices, gt_indices) in enumerate(matches):
             scene_index = flat_view // num_views
@@ -223,7 +223,7 @@ class ReconstructionObjectHead(nn.Module):
 
             (id_to_index, duplicate_ids, missing_id_field, labels_3d,
              centers_vggt, sizes_vggt, centers_aligned,
-             sizes_aligned) = scene_targets[scene_index]
+             sizes_aligned, yaws_aligned) = scene_targets[scene_index]
             for query_index, gt_index, label_2d, instance_id in zip(
                     query_indices.tolist(), gt_indices.tolist(),
                     labels_2d.tolist(), ids_2d.tolist()):
@@ -249,6 +249,7 @@ class ReconstructionObjectHead(nn.Module):
                     continue
                 bbox_centers[flat_view, query_index] = centers_vggt[box_index]
                 bbox_sizes[flat_view, query_index] = sizes_vggt[box_index]
+                bbox_yaw[flat_view, query_index, 0] = yaws_aligned[box_index]
                 bbox_centers_aligned[flat_view, query_index] = (
                     centers_aligned[box_index])
                 bbox_sizes_aligned[flat_view, query_index] = (
@@ -266,6 +267,7 @@ class ReconstructionObjectHead(nn.Module):
             'bbox_sizes_vggt': bbox_sizes,
             'bbox_centers_aligned': bbox_centers_aligned,
             'bbox_sizes_aligned': bbox_sizes_aligned,
+            'bbox_yaw_aligned': bbox_yaw,
             'bbox_valid': bbox_valid,
             'identity_flat_indices': (
                 torch.cat(identity_flat_indices)
@@ -337,20 +339,21 @@ class ReconstructionObjectHead(nn.Module):
                 pred_sizes_aligned[scene_mask] = scene_sizes[0]
             target_centers_aligned = targets['bbox_centers_aligned'][valid]
             target_sizes_aligned = targets['bbox_sizes_aligned'][valid]
-            pred_boxes = _center_size_to_minmax(
-                pred_centers_aligned, pred_sizes_aligned)
-            target_boxes = _center_size_to_minmax(
-                target_centers_aligned, target_sizes_aligned)
-            giou = axis_aligned_bbox_overlaps_3d(
-                pred_boxes.unsqueeze(0), target_boxes.unsqueeze(0),
-                mode='giou', is_aligned=True).squeeze(0)
+            pred_yaw = predictions['bbox_yaw_aligned'][valid]
+            target_yaw = targets['bbox_yaw_aligned'][valid]
+            yaw_loss = F.mse_loss(pred_yaw, target_yaw, reduction='sum') / bbox_avg_factor
+            pred_boxes = pack_boxes(pred_centers_aligned, pred_sizes_aligned, pred_yaw)
+            target_boxes = pack_boxes(target_centers_aligned, target_sizes_aligned, target_yaw)
+            giou = rotated_overlaps(pred_boxes, target_boxes, mode='giou', aligned=True)
             giou_loss = (1.0 - giou).sum() / bbox_avg_factor
         else:
             center_loss = zero
             size_loss = zero
             giou_loss = zero
+            yaw_loss = predictions['bbox_yaw_aligned'].sum() * 0.
 
         losses = {
+            'loss_recon_bbox_yaw': yaw_loss * self.yaw_weight,
             'loss_recon_instance': instance_loss * self.instance_weight,
             'loss_recon_bbox_cls': cls_loss,
             'loss_recon_bbox_center': center_loss * self.center_weight,
