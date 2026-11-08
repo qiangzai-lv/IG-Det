@@ -90,7 +90,7 @@ def validate_scene(info: dict) -> None:
         raise ValueError(f'{scene}: duplicate instance IDs')
 
 
-def add_metadata(payload: dict) -> dict:
+def add_metadata(payload: dict, progress=None) -> dict:
     """Return a metadata-enriched copy of a ARKitScenes info payload."""
     if not isinstance(payload, dict) or not isinstance(
             payload.get('data_list'), list):
@@ -100,9 +100,12 @@ def add_metadata(payload: dict) -> dict:
     enriched = dict(payload)
     enriched['metainfo'] = dict(payload['metainfo'], dataset='arkitscenes')
     enriched_records = []
-    for info in payload['data_list']:
+    total = len(payload['data_list'])
+    for index, info in enumerate(payload['data_list'], 1):
         if not isinstance(info, dict):
             raise TypeError('every data_list item must be a dict')
+        if progress is not None and (index == 1 or index % 10 == 0 or index == total):
+            progress(f'Validating scene {index}/{total}: {scene_id_from_info(info)}')
         validate_scene(info)
         updated_info = dict(info)
         updated_info['scene_id'] = scene_id_from_info(info)
@@ -129,9 +132,11 @@ def add_metadata(payload: dict) -> dict:
 def update_file(input_path: Path, output_path: Path) -> None:
     if input_path.resolve() == output_path.resolve():
         raise ValueError('Use a separate output path; preserve the original annotations')
+    print(f'Loading annotations: {input_path}', flush=True)
     with input_path.open('rb') as handle:
         payload = pickle.load(handle)
-    enriched = add_metadata(payload)
+    enriched = add_metadata(payload, progress=lambda message: print(message, flush=True))
+    print(f'Writing metadata: {output_path}', flush=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
             mode='wb', dir=output_path.parent,

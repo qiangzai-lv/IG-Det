@@ -27,8 +27,11 @@ if [[ "${SPLIT}" != "train" && "${SPLIT}" != "val" && "${SPLIT}" != "all" ]]; th
   exit 2
 fi
 
-mkdir -p "${OUTPUT_ROOT}"
 cd "${REPO_ROOT}"
+mkdir -p "${OUTPUT_ROOT}"
+export PYTHONUNBUFFERED=1
+echo "[$(date '+%F %T')] Starting ARKitScenes generation: split=${SPLIT} shards=[${SHARD_START},${SHARD_END})/${MAX_PARALLEL}"
+echo "Data: ${DATA_ROOT}; output: ${OUTPUT_ROOT}; python: ${PYTHON_BIN}"
 
 running_pids=()
 cleanup() {
@@ -42,7 +45,8 @@ trap cleanup EXIT INT TERM
 ensure_metadata() {
   local source_file="$1"
   local output_file="$2"
-  "${PYTHON_BIN}" utils/add_arkitscenes_3d_instance_metadata.py \
+  echo "[$(date '+%F %T')] Preparing metadata: ${source_file}"
+  "${PYTHON_BIN}" -u utils/add_arkitscenes_3d_instance_metadata.py \
     --input "${source_file}" --output "${output_file}"
 }
 
@@ -56,7 +60,9 @@ run_split() {
   mkdir -p "${scene_dir}"
   running_pids=()
   for ((shard_id = SHARD_START; shard_id < SHARD_END; shard_id++)); do
+    echo "[$(date '+%F %T')] Launching ${split_name} shard ${shard_id}/${MAX_PARALLEL}"
     env \
+      ARKIT_METADATA_PREPARED=1 \
       PYTHON_BIN="${PYTHON_BIN}" \
       DATA_ROOT="${DATA_ROOT}" \
       OUTPUT_ROOT="${OUTPUT_ROOT}" \
