@@ -36,3 +36,10 @@ bash utils/merge_scannet_2d_shards.sh
 conda run -n mmcv python /data/working/IG-Det/utils/visualize_training_instance_points.py \
   --num-views -1 \
   --output-dir /data/working/IG-Det/work_dirs/train_instance_points_all_views
+
+conda activate mmcv
+
+MAX_PARALLEL=4 SPLIT=all \
+bash utils/generate_arkitscenes_2d_all_shards.sh
+
+SPLIT=all bash utils/merge_arkitscenes_2d_shards.sh
