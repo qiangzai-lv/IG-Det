@@ -120,7 +120,8 @@ def rotated_overlaps(a, b, mode='iou', aligned=False, bev=False, chunk_size=2048
         shape = (len(a),) if aligned else (len(a),len(b))
         if not len(a) or not len(b):
             return (a.sum()+b.sum()).expand(shape)*0
-        if not aligned and mode=='iou' and a.is_cuda and not torch.is_grad_enabled():
+        # NPU migration adapters can remap is_cuda; inspect the actual device.
+        if not aligned and mode=='iou' and a.device.type == 'cuda' and not torch.is_grad_enabled():
             from mmcv.ops import box_iou_rotated
             # MMCV clockwise=True uses the numeric Rz(+yaw) matrix. Its
             # name refers to image Y-down, not the scene Y-up convention.
