@@ -7,3 +7,10 @@ conda run --no-capture-output -n mmcv python vis/visualize_val_predictions.py \
   --score-thr 0.01 \
   --verify-predictions \
   --overwrite
+
+python vis/filter_predictions_with_gt.py \
+  --input-dir vis/outputs/visualization_all \
+  --config configs/igdet/igdet_scannet.py \
+  --output-dir vis/outputs/filtered_predictions \
+  --score-thr 0.013 \
+  --overwrite
