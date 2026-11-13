@@ -31,3 +31,10 @@ python3 download_scannet_mesh.py --accept-terms \
 set "BLENDER_EXE=D:\Blender\blender.exe"
 render_predictions_windows.bat --scene scene0025_02
 
+
+python vis/filter_query_boxes_nms_topk.py \
+  --input-dir vis/outputs/visualization_all/queries \
+  --output-dir vis/outputs/query_nms_topk \
+  --nms-iou-thr 0.5 \
+  --top-k 64 \
+  --overwrite
