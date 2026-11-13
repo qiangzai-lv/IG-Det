@@ -21,3 +21,13 @@ python vis/filter_predictions_with_gt.py \
   --output-dir vis/outputs/gt_iou_predictions \
   --min-iou 0 \
   --overwrite
+
+
+cd /Users/lvxueqiang/Desktop/CVPR2027_v3/visualize
+
+python3 download_scannet_mesh.py --accept-terms \
+  --scene-ids scene0427_00
+
+set "BLENDER_EXE=D:\Blender\blender.exe"
+render_predictions_windows.bat --scene scene0025_02
+
