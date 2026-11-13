@@ -38,3 +38,6 @@ python vis/filter_query_boxes_nms_topk.py \
   --nms-iou-thr 0.5 \
   --top-k 64 \
   --overwrite
+
+
+python3 visualize/project_query_boxes.py --scene scene0015_00
