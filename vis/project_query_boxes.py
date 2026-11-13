@@ -61,7 +61,7 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT / 'projections_query')
     parser.add_argument('--resolution', type=int, default=3200)
     parser.add_argument('--point-radius', type=float, default=1.5, help='Point radius in output pixels')
-    parser.add_argument('--line-width', type=int, default=3)
+    parser.add_argument('--line-width', type=int, default=6)
     args = parser.parse_args()
     if args.resolution <= 0 or args.point_radius <= 0 or args.line_width <= 0:
         parser.error('Resolution, point radius and line width must be positive')
