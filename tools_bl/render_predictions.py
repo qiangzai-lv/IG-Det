@@ -5,6 +5,7 @@ Run with Blender:
 """
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -37,9 +38,9 @@ def main():
         boxes.name = 'Prediction boxes'
         material = boxes.data.materials[0]
         material.name = 'Prediction blue'
-        shader = material.node_tree.nodes.get('Principled BSDF')
+        shader = next(node for node in material.node_tree.nodes if node.bl_idname == 'ShaderNodeBsdfPrincipled')
         shader.inputs['Base Color'].default_value = (0.0, 0.25, 1.0, 1.0)
-        shader.inputs['Emission Color'].default_value = (0.0, 0.25, 1.0, 1.0)
+        (shader.inputs.get('Emission Color') or shader.inputs['Emission']).default_value = (0.0, 0.25, 1.0, 1.0)
         return boxes
 
     gt.make_boxes = make_prediction_boxes
@@ -69,6 +70,7 @@ def main():
             gt.render(scene, info, args)
         except Exception as error:
             failed.append(scene)
+            traceback.print_exc()
             print(f'FAILED {scene}: {error}', file=sys.stderr, flush=True)
     if failed:
         raise RuntimeError('Failed scenes: ' + ', '.join(failed))

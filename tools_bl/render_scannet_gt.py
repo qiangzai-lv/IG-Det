@@ -45,10 +45,12 @@ def make_boxes(instances, radius):
     bpy.context.collection.objects.link(obj)
     material = bpy.data.materials.new('GT box red')
     material.use_nodes = True
-    shader = material.node_tree.nodes.get('Principled BSDF')
+    shader = next(node for node in material.node_tree.nodes if node.bl_idname == 'ShaderNodeBsdfPrincipled')
     shader.inputs['Base Color'].default_value = (1, 0, 0, 1)
-    shader.inputs['Emission Color'].default_value = (1, 0, 0, 1)
-    shader.inputs['Emission Strength'].default_value = 1
+    emission_color = shader.inputs.get('Emission Color') or shader.inputs['Emission']
+    emission_color.default_value = (1, 0, 0, 1)
+    if shader.inputs.get('Emission Strength'):
+        shader.inputs['Emission Strength'].default_value = 1
     curve.materials.append(material)
     return obj
 
@@ -68,13 +70,14 @@ def render(scene_id, info, args):
         raise ValueError(f'No vertex colors in {mesh_path}')
     mat = bpy.data.materials.new('Vertex colors')
     mat.use_nodes = True
-    shader = mat.node_tree.nodes.get('Principled BSDF')
+    shader = next(node for node in mat.node_tree.nodes if node.bl_idname == 'ShaderNodeBsdfPrincipled')
     vertex = mat.node_tree.nodes.new('ShaderNodeVertexColor')
     vertex.layer_name = color.name
     mat.node_tree.links.new(vertex.outputs['Color'], shader.inputs['Base Color'])
-    mat.node_tree.links.new(vertex.outputs['Color'], shader.inputs['Emission Color'])
+    mat.node_tree.links.new(vertex.outputs['Color'], shader.inputs.get('Emission Color') or shader.inputs['Emission'])
     shader.inputs['Roughness'].default_value = 0.85
-    shader.inputs['Emission Strength'].default_value = 0.4
+    if shader.inputs.get('Emission Strength'):
+        shader.inputs['Emission Strength'].default_value = 0.4
     mesh.data.materials.clear()
     mesh.data.materials.append(mat)
     make_boxes(info['instances'], args.box_radius)
@@ -98,7 +101,7 @@ def render(scene_id, info, args):
     scene.cycles.use_denoising = True
     scene.render.film_transparent = True
     scene.world.use_nodes = True
-    background = scene.world.node_tree.nodes['Background']
+    background = next(node for node in scene.world.node_tree.nodes if node.bl_idname == 'ShaderNodeBackground')
     background.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1)
     background.inputs['Strength'].default_value = 0.5
     for direction, power, size in [((2,-3,5),1200,1.8), ((-4,-1,3),800,2.5), ((1,4,4),950,2.0)]:
