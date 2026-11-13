@@ -77,7 +77,7 @@ def render(scene_id, info, args):
     mat.node_tree.links.new(vertex.outputs['Color'], shader.inputs.get('Emission Color') or shader.inputs['Emission'])
     shader.inputs['Roughness'].default_value = 0.85
     if shader.inputs.get('Emission Strength'):
-        shader.inputs['Emission Strength'].default_value = 0.4
+        shader.inputs['Emission Strength'].default_value = 0.25
     mesh.data.materials.clear()
     mesh.data.materials.append(mat)
     make_boxes(info['instances'], args.box_radius)
@@ -97,18 +97,39 @@ def render(scene_id, info, args):
     scene = bpy.context.scene
     scene.camera = camera
     scene.render.engine = 'CYCLES'
+    if getattr(args, 'device', 'cpu') == 'gpu':
+        prefs = bpy.context.preferences.addons['cycles'].preferences
+        chosen = None
+        for backend in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI', 'METAL'):
+            try:
+                prefs.compute_device_type = backend
+                prefs.get_devices()
+                devices = [device for device in prefs.devices if device.type == backend]
+                if devices:
+                    for device in prefs.devices:
+                        device.use = device in devices
+                    chosen = backend
+                    print('Cycles GPU:', backend, ', '.join(device.name for device in devices), flush=True)
+                    break
+            except (TypeError, ValueError, RuntimeError):
+                continue
+        if chosen is None:
+            raise RuntimeError('No supported Cycles GPU found. Check the Blender version, graphics driver, and GPU support.')
+        scene.cycles.device = 'GPU'
+    else:
+        scene.cycles.device = 'CPU'
     scene.cycles.samples = args.samples
     scene.cycles.use_denoising = True
     scene.render.film_transparent = True
     scene.world.use_nodes = True
     background = next(node for node in scene.world.node_tree.nodes if node.bl_idname == 'ShaderNodeBackground')
     background.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1)
-    background.inputs['Strength'].default_value = 0.5
+    background.inputs['Strength'].default_value = 0.35
     for direction, power, size in [((2,-3,5),1200,1.8), ((-4,-1,3),800,2.5), ((1,4,4),950,2.0)]:
         bpy.ops.object.light_add(type='AREA', location=center + Vector(direction).normalized() * scale * 1.5)
         light = bpy.context.object
         light.rotation_euler = (center - light.location).to_track_quat('-Z', 'Y').to_euler()
-        light.data.energy = power * 0.4 * (scale / 5.0) ** 2
+        light.data.energy = power * 0.3 * (scale / 5.0) ** 2
         light.data.shape = 'DISK'
         light.data.size = size * scale
     scene.view_settings.view_transform = 'Standard'

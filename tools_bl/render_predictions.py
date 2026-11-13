@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT / 'renders_predictions')
     parser.add_argument('--resolution', type=int, default=3200)
     parser.add_argument('--samples', type=int, default=32)
+    parser.add_argument('--device', choices=['cpu', 'gpu'], default='cpu', help='Cycles render device (default: cpu)')
     parser.add_argument('--box-radius', type=float, default=0.015)
     parser.add_argument('--raw', action='store_true', help='Render raw predictions instead of GT-IoU-selected predictions')
     parser.add_argument('--score-threshold', type=float, default=0.0)
