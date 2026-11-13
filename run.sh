@@ -14,3 +14,10 @@ python vis/filter_predictions_with_gt.py \
   --output-dir vis/outputs/filtered_predictions \
   --score-thr 0.013 \
   --overwrite
+
+  python vis/filter_predictions_by_gt_iou.py \
+  --input-dir vis/outputs/visualization_all \
+  --config configs/igdet/igdet_scannet.py \
+  --output-dir vis/outputs/gt_iou_predictions \
+  --min-iou 0 \
+  --overwrite
