@@ -471,7 +471,10 @@ def parse_args():
                         help='auto (NPU, CUDA, CPU), npu[:index], cuda[:index], or cpu')
     parser.add_argument('--seed',type=int,default=0)
     parser.add_argument('--verify-predictions',action='store_true',
-                        help='Repeat first scene without capture and require exactly equal predictions')
+                        help='Repeat first scene without capture; compare using device-specific tolerances')
+    parser.add_argument('--verification-box-atol',type=float,help='Box absolute tolerance in meters (NPU: 0.001; others: 0)')
+    parser.add_argument('--verification-score-atol',type=float,help='Score absolute tolerance (NPU: 0.00001; others: 0)')
+    parser.add_argument('--verification-rtol',type=float,help='Relative tolerance (default: 0)')
     parser.add_argument('--no-preview',action='store_true')
     parser.add_argument('--overwrite',action='store_true')
     parser.add_argument('--preview-elev',type=float,default=55)
@@ -486,16 +489,36 @@ def parse_args():
         parser.error('--score-thr must be in [0,1]')
     if args.query_score_thr is not None and not 0 <= args.query_score_thr <= 1:
         parser.error('--query-score-thr must be in [0,1]')
+    for name in ('verification_box_atol','verification_score_atol','verification_rtol'):
+        value = getattr(args,name)
+        if value is not None and (not np.isfinite(value) or value < 0):
+            parser.error(f'--{name.replace("_","-")} must be finite and nonnegative')
     if not args.from_results and not (args.config and args.checkpoint):
         parser.error('--config and --checkpoint are required without --from-results')
     return args
 
 
-def compare_predictions(baseline, observed):
-    """Exact equality is expected for transparent instrumentation on one GPU."""
+def verification_tolerances(device, box_atol=None, score_atol=None, rtol=None):
+    """Metric boxes: allow up to 1 mm on NPU; other devices stay exact."""
+    npu = str(device).split(':')[0] == 'npu'
+    return dict(box_atol=(1e-3 if npu else 0.) if box_atol is None else box_atol,
+                score_atol=(1e-5 if npu else 0.) if score_atol is None else score_atol,
+                rtol=0. if rtol is None else rtol)
+
+
+def compare_predictions(baseline, observed, *, box_atol=0., score_atol=0., rtol=0.):
+    """Compare corresponding post-NMS rows; never relax labels or counts.
+
+    Tolerance-based success is recorded separately from bitwise equality. This
+    checks agreement within the stated bounds, not proof of instrumentation
+    equivalence or the cause of accelerator numerical variation.
+    """
+    if any(not np.isfinite(v) or v < 0 for v in (box_atol,score_atol,rtol)):
+        raise ValueError('Verification tolerances must be finite and nonnegative')
     if len(baseline) != len(observed):
         raise AssertionError('Prediction batch lengths differ')
-    max_difference = 0.0
+    exact_match = True
+    maxima = dict(bboxes_3d=0.,scores_3d=0.,labels_3d=0.)
     for first, second in zip(baseline, observed):
         for key in ('bboxes_3d', 'scores_3d', 'labels_3d'):
             a, b = getattr(first.pred_instances_3d,key), getattr(second.pred_instances_3d,key)
@@ -503,11 +526,28 @@ def compare_predictions(baseline, observed):
                 a, b = a.tensor, b.tensor
             if a.shape != b.shape:
                 raise AssertionError(f'{key}: shape changed {a.shape} -> {b.shape}')
-            if a.numel():
-                max_difference = max(max_difference,float((a.float()-b.float()).abs().max()))
-            if not torch.equal(a,b):
-                raise AssertionError(f'{key}: predictions changed; max absolute difference {max_difference}')
-    return dict(exact_match=True, max_absolute_difference=max_difference)
+            a, b = a.detach().cpu(), b.detach().cpu()
+            if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+                raise AssertionError(f'{key}: nonfinite predictions')
+            equal = torch.equal(a,b)
+            exact_match &= equal
+            if key == 'labels_3d':
+                if not equal:
+                    raise AssertionError('labels_3d: class labels or row order changed')
+                continue
+            # Compare on CPU in float64 to avoid backend-dependent comparison kernels.
+            a, b = a.double(), b.double()
+            difference = float((a-b).abs().max()) if a.numel() else 0.
+            maxima[key] = max(maxima[key],difference)
+            atol = box_atol if key == 'bboxes_3d' else score_atol
+            if not torch.allclose(b,a,atol=atol,rtol=rtol):
+                raise AssertionError(f'{key}: predictions exceed tolerance; '
+                    f'max absolute difference {difference}, atol={atol}, rtol={rtol}')
+    return dict(exact_match=bool(exact_match),within_tolerance=True,labels_exact=True,
+                max_absolute_difference=max(maxima.values()),
+                max_box_absolute_difference=maxima['bboxes_3d'],
+                max_score_absolute_difference=maxima['scores_3d'],
+                box_atol=box_atol,score_atol=score_atol,rtol=rtol)
 
 
 def main():
@@ -582,8 +622,15 @@ def main():
                     raise RuntimeError('Current model did not expose query initialization')
                 query_payload = capture.payload
             if baseline is not None:
-                index['prediction_verification'] = compare_predictions(baseline,predictions)
-                print('Prediction verification: exact match with capture disabled',flush=True)
+                tolerances = verification_tolerances(args.device,args.verification_box_atol,
+                                                     args.verification_score_atol,args.verification_rtol)
+                report = compare_predictions(baseline,predictions,**tolerances)
+                index['prediction_verification'] = report
+                status = 'exact match' if report['exact_match'] else 'agreement within tolerance (not exact)'
+                print(f'Prediction verification: {status}; '
+                      f'box max difference={report["max_box_absolute_difference"]:.9g} m; '
+                      f'score max difference={report["max_score_absolute_difference"]:.9g}; '
+                      f'tolerances={tolerances}',flush=True)
                 del baseline
             sample = predictions[0]
             path, points = model._load_axis_aligned_gt_points(sample.metainfo)

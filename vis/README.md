@@ -233,7 +233,7 @@ conda run --no-capture-output -n mmcv python vis/visualize_val_predictions.py \
 
 `--from-results` 同时支持旧版逐场景目录和新版 `queries/`、`predictions/` 目录，输出必须使用另一个目录以保护源数据。已有非空输出目录需要显式 `--overwrite`。`--score-thr` 默认 0.3，作用于两类框；`--query-score-thr` 可以单独设置 Query 显示阈值。`--query-topk` 仅限制显示数量，原始数据不会截断。默认全部场景，可用 `--scenes` 或 `--max-scenes` 选取子集。`--max-points` 仅限制 PLY/图片背景点数，NPZ 保留收到的完整背景点云。
 
-`--verify-predictions` 对首场景增加一次无采集前向，严格比较全部检测框、分数和类别。脚本固定随机种子，不强制模型 CUDA cumsum 不支持的全局确定性算法。
+`--verify-predictions` 对首场景增加一次无采集前向，比较全部检测框、分数和类别。CUDA/CPU 默认逐元素完全一致；NPU 默认框坐标/尺寸绝对容差 0.001 米、分数绝对容差 0.00001、相对容差 0。框数量和逐行类别始终要求完全一致。脚本固定随机种子，不强制模型 CUDA cumsum 不支持的全局确定性算法。
 
 2026-11-13 已完成 epoch-1 权重 10/10 场景 × 128 视图验证，首场景采集开关前后输出完全一致。新版格式通过全部 10 场景原始数组/JSON 对照检查。当前 epoch-1 分数约 0.011–0.015，0.01 仅用于检查几何位置。
 
@@ -261,3 +261,29 @@ python vis/visualize_val_predictions.py \
 ```
 
 双前向验证保存并恢复 Python、NumPy、CPU 和所选 NPU/CUDA 设备的随机状态，发生异常也会恢复。NPU 路径不调用 CUDA 随机接口，使用 [torch_npu 官方 get_rng_state / set_rng_state 接口](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/random.py)。NPU 分支通过模拟后端测试；本地没有 NPU 硬件，未完成真实 NPU 前向验证。
+
+NPU 重复前向可能存在小幅数值差异。验证报告区分 `exact_match` 与 `within_tolerance`，记录框/分数各自最大差值及采用的容差，不将容差内通过表述为逐元素完全一致。可显式设置 `--verification-box-atol 0.001 --verification-score-atol 0.00001 --verification-rtol 0`；三个参数均设为 0 即恢复严格检查。超限、非有限值、数量或类别变化仍会中止验证。容差内一致不能单独证明差异来源或采集绝对等价。
+
+### 已保存预测的阈值筛选与 GT 对照
+
+独立脚本 `vis/filter_predictions_with_gt.py` 读取历史预测，不加载 checkpoint、不执行模型前向。默认处理输入中的全部场景：
+
+```bash
+python vis/filter_predictions_with_gt.py \
+  --input-dir vis/outputs/visualization_all \
+  --config configs/igdet/igdet_scannet.py \
+  --output-dir vis/outputs/filtered_predictions \
+  --score-thr 0.013
+```
+
+输入支持新版 `predictions/<scene>_predictions.npz`、直接 predictions 目录或单个 NPZ，以及旧版 `<scene>/predictions.npz`。`--config` 必须提供与输入场景匹配的验证集 GT；不会只取两者交集而默默遗漏场景。
+
+每场景输出 `<scene>_filtered_predictions.npz/.json`、`<scene>_gt_predictions.ply/.png`。背景使用验证集原始 XYZRGB 点云，坐标轴只转换一次；GT 标注框已在场景轴坐标中，使用重力中心后直接显示，避免二次对齐。
+
+GT 框绿色（PNG 虚线），筛选后预测框红色；`--label-text` 可加类别与分数。NPZ 主字段 `boxes_center_size_world/scores/labels` 是筛选后结果，`raw_*` 字段保留输入的完整预测；`source_indices/selection_mask` 可追溯筛选索引。另保存 GT 框/类别、完整彩色点云和轴对齐矩阵。JSON 的 `predictions` 是全部输入，`filtered_predictions` 是筛选子集。
+
+只按 `score >= --score-thr` 及有限值/正尺寸/有效类别检查筛选，不使用 GT IoU 筛选、匹配或修正预测，不重新 NMS。提高阈值可减少低分框，但不会修正定位错误。`--max-points` 仅减少可视化背景，NPZ 仍保存完整点云。需要重做时用 `--overwrite`；输出目录须与输入分开。
+
+```bash
+conda run -n mmcv python -m pytest -q vis/test_filter_predictions_with_gt.py
+```

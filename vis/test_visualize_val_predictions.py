@@ -323,3 +323,45 @@ def test_cpu_rng_restore_does_not_touch_accelerators(monkeypatch):
     with vis.preserve_random_state('cpu'):
         torch.rand(5)
     assert torch.equal(torch.get_rng_state(),state)
+
+
+def test_npu_verification_reports_tolerance_without_claiming_exactness():
+    import copy
+    from types import SimpleNamespace as NS
+    first=NS(pred_instances_3d=NS(bboxes_3d=NS(tensor=torch.ones(1,6)),
+             scores_3d=torch.tensor([.012]),labels_3d=torch.tensor([2])))
+    second=copy.deepcopy(first)
+    second.pred_instances_3d.bboxes_3d.tensor[0,0] += .0006844997
+    second.pred_instances_3d.scores_3d += .000001
+    with pytest.raises(AssertionError,match='bboxes_3d'):
+        vis.compare_predictions([first],[second])
+    report=vis.compare_predictions([first],[second],**vis.verification_tolerances('npu:0'))
+    assert report['within_tolerance'] and not report['exact_match']
+    assert report['labels_exact']
+    assert .00068 < report['max_box_absolute_difference'] < .00069
+    assert report['max_score_absolute_difference'] < 1e-5
+    assert vis.verification_tolerances('cuda:0')['box_atol'] == 0
+    assert vis.verification_tolerances('npu:0',0,0,0)['box_atol'] == 0
+
+
+def test_verification_rejects_large_errors_labels_counts_and_nonfinite():
+    import copy
+    from types import SimpleNamespace as NS
+    first=NS(pred_instances_3d=NS(bboxes_3d=NS(tensor=torch.ones(1,6)),
+             scores_3d=torch.tensor([.012]),labels_3d=torch.tensor([2])))
+    tol=vis.verification_tolerances('npu:0')
+    for key,value in [('box',.01),('score',.0001),('label',3),('nan',float('nan'))]:
+        second=copy.deepcopy(first)
+        if key=='box': second.pred_instances_3d.bboxes_3d.tensor[0,0] += value
+        elif key=='score': second.pred_instances_3d.scores_3d += value
+        elif key=='label': second.pred_instances_3d.labels_3d[0] = value
+        else: second.pred_instances_3d.bboxes_3d.tensor[0,0] = value
+        with pytest.raises(AssertionError):
+            vis.compare_predictions([first],[second],**tol)
+    second=copy.deepcopy(first)
+    second.pred_instances_3d.bboxes_3d.tensor=torch.ones(2,6)
+    with pytest.raises(AssertionError,match='shape changed'):
+        vis.compare_predictions([first],[second],**tol)
+    for invalid in (-1,float('nan'),float('inf')):
+        with pytest.raises(ValueError):
+            vis.compare_predictions([],[],box_atol=invalid)
