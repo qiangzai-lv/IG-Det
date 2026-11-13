@@ -2,7 +2,7 @@ from collections.abc import Sequence
 
 import torch
 
-from vggt_omega.utils.pose_enc import extri_intri_to_pose_encoding
+from vggt.utils.pose_enc import extri_intri_to_pose_encoding
 
 
 VGGT_CAMERA_LOSS_DEFAULTS = dict(

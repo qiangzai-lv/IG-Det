@@ -69,13 +69,11 @@ class LoRALinear(nn.Module):
 _DEFAULT_CONFIG = {
     'enabled': False,
     'block_indices': (),
-    'branches': ('frame_blocks', 'inter_frame_blocks'),
+    'branches': ('frame_blocks', 'global_blocks'),
     'target_modules': ('attn.qkv', 'attn.proj'),
     'rank': 8,
     'alpha': 16,
     'dropout': 0.0,
-    'gradient_checkpointing': False,
-    'checkpoint_start_block': 0,
 }
 
 
@@ -133,11 +131,8 @@ def configure_vggt_lora(
         raise ValueError('VGGT aggregator depth must be positive')
 
     enabled = values['enabled']
-    checkpoint_enabled = values['gradient_checkpointing']
     if not isinstance(enabled, bool):
         raise TypeError('enabled must be boolean')
-    if not isinstance(checkpoint_enabled, bool):
-        raise TypeError('gradient_checkpointing must be boolean')
 
     rank = values['rank']
     alpha = values['alpha']
@@ -153,16 +148,8 @@ def configure_vggt_lora(
     if not 0.0 <= dropout < 1.0:
         raise ValueError('dropout must be in [0, 1)')
 
-    checkpoint_start = values['checkpoint_start_block']
-    if (not isinstance(checkpoint_start, int)
-            or isinstance(checkpoint_start, bool)
-            or checkpoint_start < 0 or checkpoint_start >= depth):
-        raise ValueError('checkpoint_start_block is out of range')
-
     aggregator.requires_grad_(False)
     if not enabled:
-        if hasattr(aggregator, 'configure_gradient_checkpointing'):
-            aggregator.configure_gradient_checkpointing(False, 0)
         return LoRAInjectionSummary((), 0)
 
     block_indices = _validate_indices(
@@ -181,7 +168,7 @@ def configure_vggt_lora(
     if len(set(targets)) != len(targets):
         raise ValueError('target_modules contains duplicates')
     for branch in branches:
-        if branch not in ('frame_blocks', 'inter_frame_blocks'):
+        if branch not in ('frame_blocks', 'global_blocks'):
             raise ValueError(f'Unknown VGGT LoRA branch: {branch}')
         if not hasattr(aggregator, branch):
             raise AttributeError(f'VGGT aggregator has no branch {branch!r}')
@@ -205,9 +192,6 @@ def configure_vggt_lora(
                     LoRALinear(base_layer, rank, alpha, dropout))
                 replaced.append(f'{branch}.{block_index}.{target}')
 
-    if hasattr(aggregator, 'configure_gradient_checkpointing'):
-        aggregator.configure_gradient_checkpointing(
-            checkpoint_enabled, checkpoint_start)
     trainable = sum(parameter.numel() for parameter in aggregator.parameters()
                     if parameter.requires_grad)
     return LoRAInjectionSummary(tuple(replaced), trainable)
@@ -230,8 +214,7 @@ def format_vggt_lora_summary(
          f"dropout={values['dropout']}"),
         (f'  injected_modules={len(summary.replaced_modules)}, '
          f'trainable_parameters={summary.trainable_parameters:,}'),
-        (f"  gradient_checkpointing={values['gradient_checkpointing']}, "
-         f"checkpoint_start_block={values['checkpoint_start_block']}"),
+        '  activation checkpointing follows the native VGGT training mode',
         '  injected module names:',
     ]
     lines.extend(f'  - {name}' for name in summary.replaced_modules)

@@ -3,15 +3,15 @@ import copy
 import torch
 import torch.nn as nn
 
-from vggt_omega.models.heads.dense_head import DenseHead
+from vggt.heads.dpt_head import DPTHead
 
 
 class VGGTFeatureProjector(nn.Module):
-    def __init__(self, dense_head, dim_in, out_channels):
+    def __init__(self, depth_head, dim_in, out_channels):
         super().__init__()
-        self.patch_size = dense_head.patch_size
-        self.intermediate_layer_idx = dense_head.intermediate_layer_idx
-        self.norm = copy.deepcopy(dense_head.norm)
+        self.patch_size = depth_head.patch_size
+        self.intermediate_layer_idx = depth_head.intermediate_layer_idx
+        self.norm = copy.deepcopy(depth_head.norm)
         self.output_projects = nn.ModuleList([
             nn.Conv2d(
                 in_channels=dim_in,
@@ -31,6 +31,8 @@ class VGGTFeatureProjector(nn.Module):
         for feature_idx, layer_idx in enumerate(
                 self.intermediate_layer_idx):
             feature = aggregated_tokens_list[layer_idx]
+            if feature is None:
+                raise ValueError(f'VGGT aggregator did not cache layer {layer_idx}')
             feature = feature[:, :, patch_token_start:]
             if feature.dtype != torch.float32:
                 feature = feature.float()
@@ -40,7 +42,7 @@ class VGGTFeatureProjector(nn.Module):
             feature = feature.permute(0, 2, 1).reshape(
                 batch_size * num_frames, feature.shape[-1],
                 patch_height, patch_width)
-            feature = DenseHead._apply_pos_embed(
+            feature = DPTHead._apply_pos_embed(
                 self, feature, width, height)
             feature = self.output_projects[feature_idx](feature)
             channels = feature.shape[1]
@@ -55,18 +57,18 @@ class VGGTFeatureProjector(nn.Module):
 class VGGTDetectionPyramid(nn.Module):
     """Convert cached VGGT tokens into GroundingDINO feature levels."""
 
-    def __init__(self, dense_head, out_channels=256, norm_groups=32):
+    def __init__(self, depth_head, out_channels=256, norm_groups=32):
         super().__init__()
         if out_channels <= 0:
             raise ValueError('out_channels must be positive')
         if norm_groups <= 0 or out_channels % norm_groups != 0:
             raise ValueError('norm_groups must divide out_channels')
-        self.patch_size = dense_head.patch_size
+        self.patch_size = depth_head.patch_size
         self.intermediate_layer_idx = tuple(
-            dense_head.intermediate_layer_idx)
-        self.norm = copy.deepcopy(dense_head.norm)
-        self.projects = copy.deepcopy(dense_head.projects)
-        self.resize_layers = copy.deepcopy(dense_head.resize_layers)
+            depth_head.intermediate_layer_idx)
+        self.norm = copy.deepcopy(depth_head.norm)
+        self.projects = copy.deepcopy(depth_head.projects)
+        self.resize_layers = copy.deepcopy(depth_head.resize_layers)
         self.adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(
@@ -101,7 +103,7 @@ class VGGTDetectionPyramid(nn.Module):
                 batch_size * num_frames, feature.shape[-1],
                 patch_height, patch_width)
             feature = self.projects[feature_idx](feature)
-            feature = DenseHead._apply_pos_embed(
+            feature = DPTHead._apply_pos_embed(
                 self, feature, width, height)
             feature = self.resize_layers[feature_idx](feature)
             feature = self.adapters[feature_idx](feature)

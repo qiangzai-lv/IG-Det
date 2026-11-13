@@ -31,10 +31,26 @@ from igdet.prediction_visualization import (
 from igdet.visualization_colors import CLASS_COLORS
 from igdet.two_d_retention import (
     read_2d_checkpoint, restore_vggt_2d_components, scale_retention_losses)
-from vggt_omega.models import VGGTOmega
-from vggt_omega.utils.pose_enc import encoding_to_camera
+from safetensors.torch import load_file
+from vggt.models.vggt import VGGT
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 device = get_device()
+
+
+def load_vggt_weights(model, checkpoint):
+    """Load the native checkpoint before injecting adapters."""
+    path = Path(checkpoint)
+    if path.suffix == '.safetensors':
+        state = load_file(str(path), device='cpu')
+    else:
+        state = torch.load(path, map_location='cpu', weights_only=True)
+        if 'state_dict' in state:
+            state = state['state_dict']
+    # These native tasks are disabled in this detection experiment.
+    state = {name: value for name, value in state.items()
+             if not name.startswith(('point_head.', 'track_head.'))}
+    model.load_state_dict(state, strict=True)
 
 
 def resolve_reconstruction_query_dims(semantic_encoder):
@@ -61,7 +77,8 @@ class IGDet(Base3DDetector):
             test_only_last_layer=True,
             position_embedding="fourier",
             if_mix_precision=False,
-            vggt_omega_checkpoint=None,
+            vggt_checkpoint=None,
+            input_image_size=(336, 448),
             vggt_lora_cfg=None,
             detection_pyramid_cfg=None,
             deformable_num_points=4,
@@ -87,6 +104,11 @@ class IGDet(Base3DDetector):
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        self.input_image_size = tuple(input_image_size)
+        if (len(self.input_image_size) != 2 or any(
+                not isinstance(size, int) or size <= 0 or size % 14
+                for size in self.input_image_size)):
+            raise ValueError('input_image_size must be positive H,W multiples of 14')
         self.train_2d_only = bool(train_2d_only)
         self.two_d_retention_cfg = dict(two_d_retention_cfg or {})
         self.retain_2d = bool(self.two_d_retention_cfg)
@@ -96,6 +118,16 @@ class IGDet(Base3DDetector):
             unknown = set(self.two_d_retention_cfg) - {'checkpoint', 'detection_weight'}
             if unknown or not self.two_d_retention_cfg.get('checkpoint'):
                 raise ValueError('2D retention requires checkpoint and optional detection_weight')
+            if (Path(self.two_d_retention_cfg['checkpoint']).resolve() !=
+                    Path(g_dino_cfg['grounding_dino_checkpoint']).resolve()):
+                raise ValueError('2D retention and semantic encoder must use the same checkpoint')
+            if not Path(self.two_d_retention_cfg['checkpoint']).is_file():
+                raise FileNotFoundError(
+                    'VGGT 3D training requires a matching VGGT 2D checkpoint: '
+                    f"{self.two_d_retention_cfg['checkpoint']}. Train "
+                    'configs/igdet/igdet_scannet_2d.py first and set both '
+                    'g_dino_cfg.grounding_dino_checkpoint and '
+                    'two_d_retention_cfg.checkpoint to its selected checkpoint.')
             scale_retention_losses({}, float(self.two_d_retention_cfg.get('detection_weight', 1.0)))
         self.use_vggt_2d_features = detection_pyramid_cfg is not None
         if self.retain_2d and not self.use_vggt_2d_features:
@@ -107,13 +139,14 @@ class IGDet(Base3DDetector):
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
 
-        self.vggt_encoder = VGGTOmega()
-        self.vggt_encoder.load_state_dict(
-            torch.load(vggt_omega_checkpoint, map_location='cpu', weights_only=True)
-        )
-        dense_head = self.vggt_encoder.dense_head
-        if self.vggt_encoder.camera_head is None or dense_head is None:
-            raise ValueError('VGGT camera and dense heads are required')
+        # Keep the pretrained DINO positional-embedding shape. Native
+        # interpolation handles the actual 336x448 image grid.
+        self.vggt_encoder = VGGT(
+            img_size=518, patch_size=14, embed_dim=1024,
+            enable_camera=True, enable_depth=True,
+            enable_point=False, enable_track=False)
+        load_vggt_weights(self.vggt_encoder, vggt_checkpoint)
+        depth_head = self.vggt_encoder.depth_head
         self.vggt_encoder.to(device)
 
         self.supervise_camera_head = bool(supervise_camera_head)
@@ -137,7 +170,7 @@ class IGDet(Base3DDetector):
             retention_state = read_2d_checkpoint(
                 self.two_d_retention_cfg['checkpoint'], vggt_lora_cfg,
                 g_dino_cfg['semantic_classes'], detection_pyramid_cfg,
-                scene_query_exchange_cfg)
+                scene_query_exchange_cfg, self.input_image_size)
 
         # gdino encoder
         self.semantic_encoder = GroundingDINOSemanticEncoder(
@@ -185,15 +218,15 @@ class IGDet(Base3DDetector):
             dropout=decoder_cfg['dec_dropout'])
 
         self.feature_projector = VGGTFeatureProjector(
-            dense_head=dense_head,
-            dim_in=dense_head.norm.normalized_shape[0],
+            depth_head=depth_head,
+            dim_in=depth_head.norm.normalized_shape[0],
             out_channels=[token_dim] * len(
-                dense_head.intermediate_layer_idx))
+                depth_head.intermediate_layer_idx))
 
         self.detection_feature_projector = None
         if self.use_vggt_2d_features:
             self.detection_feature_projector = VGGTDetectionPyramid(
-                dense_head=dense_head, **dict(detection_pyramid_cfg))
+                depth_head=depth_head, **dict(detection_pyramid_cfg))
         uses_external = getattr(
             self.semantic_encoder.model.backbone, 'requires_external_features', False)
         if uses_external != self.use_vggt_2d_features:
@@ -300,8 +333,12 @@ class IGDet(Base3DDetector):
         keep_graph = self.training and self.vggt_lora_enabled
         with vggt_feature_grad_context(keep_graph):
             # The data preprocessor converts raw BGR uint8 images to RGB without
-            # normalization. VGGT-Omega expects RGB values in [0, 1].
+            # normalization. Native VGGT expects RGB values in [0, 1].
             img = batch_inputs_dict['imgs'].float().div(255.0)
+            if tuple(img.shape[-2:]) != self.input_image_size:
+                raise ValueError(
+                    f'Expected image H,W={self.input_image_size}, '
+                    f'got {tuple(img.shape[-2:])}; check every resize pipeline')
             with autocast(img.device):
                 aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(
                     img)
@@ -376,7 +413,7 @@ class IGDet(Base3DDetector):
                                   batch_inputs_dict, batch_data_samples,
                                   return_pose_encoding=False):
         cached_tokens = [
-            token.contiguous() if token is not None else None
+            token.float().contiguous() if token is not None else None
             for token in vggt_token_list
         ]
         camera_grad_enabled = (
@@ -384,12 +421,11 @@ class IGDet(Base3DDetector):
             and torch.is_grad_enabled())
         with torch.set_grad_enabled(camera_grad_enabled):
             with autocast(images.device, enabled=False):
-                pose_encoding = self.vggt_encoder.camera_head(
-                    cached_tokens, patch_token_start=ps_idx)
+                pose_encodings = self.vggt_encoder.camera_head(cached_tokens)
 
         with torch.no_grad(), autocast(images.device, enabled=False):
-            extrinsics, intrinsics = encoding_to_camera(
-                pose_encoding.detach(), images.shape[-2:])
+            extrinsics, intrinsics = pose_encoding_to_extri_intri(
+                pose_encodings[-1].detach(), images.shape[-2:])
         scene_scale = self._resolve_vggt_gt_scale(
             batch_inputs_dict, batch_data_samples, images)
 
@@ -402,7 +438,7 @@ class IGDet(Base3DDetector):
         del cached_tokens
         cameras = (extrinsics.detach(), intrinsics.detach())
         if return_pose_encoding:
-            return cameras + (pose_encoding,)
+            return cameras + (pose_encodings,)
         return cameras
 
     def _select_reconstruction_boxes(self, reconstruction_outputs, images,

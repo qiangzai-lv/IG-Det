@@ -5,12 +5,12 @@ _base_ = [
 
 custom_imports = dict(imports=['igdet'], allow_failed_imports=False)
 
-load_from = 'data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
+load_from = '/data/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
-data_root = 'data/ScanNet_processed_v2/'
-scannet_ann_root = 'data/scannet_coco_v2_new/'
+data_root = '/data/data/ScanNet_processed_v2/'
+scannet_ann_root = '/data/data/scannet_coco_v2_new/'
 
-lang_model_name = 'data/pretrain/bert-base-uncased'
+lang_model_name = '/data/data/pretrain/bert-base-uncased'
 
 model = dict(
     type='IGGroundingDINO',
@@ -146,8 +146,8 @@ train_pipeline = [
     dict(type='RandomFlip', prob=0.5),
     dict(
         type='FixScaleResize',
-        scale=(320, 240),
-        keep_ratio=True,
+        scale=(448, 336),
+        keep_ratio=False,
         backend='pillow'),
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),
     dict(
@@ -163,8 +163,8 @@ test_pipeline = [
         imdecode_backend='pillow'),
     dict(
         type='FixScaleResize',
-        scale=(320, 240),
-        keep_ratio=True,
+        scale=(448, 336),
+        keep_ratio=False,
         backend='pillow'),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(

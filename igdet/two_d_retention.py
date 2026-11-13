@@ -30,12 +30,17 @@ def require_complete_state(source, expected, label):
 
 
 def read_2d_checkpoint(path, lora_cfg=None, classes=None,
-                       pyramid_cfg=None, exchange_cfg=None):
+                       pyramid_cfg=None, exchange_cfg=None,
+                       input_image_size=(336, 448)):
     payload = CheckpointLoader.load_checkpoint(str(path), map_location='cpu')
     source_config = payload.get('meta', {}).get('cfg')
     if source_config is None:
         raise ValueError('VGGT 2D checkpoint requires meta.cfg to verify LoRA scaling and classes')
     source = Config.fromstring(source_config, '.py').model
+    if not source.get('vggt_checkpoint') or source.get('vggt_omega_checkpoint'):
+        raise ValueError('2D checkpoint must use native VGGT, not VGGT-Omega')
+    if tuple(source.get('input_image_size', ())) != tuple(input_image_size):
+        raise ValueError('2D checkpoint input_image_size differs from joint training')
     if not source.get('train_2d_only', False) or not source.get('detection_pyramid_cfg'):
         raise ValueError('Checkpoint must come from VGGT 2D pretraining')
     if classes is not None and tuple(source.g_dino_cfg.semantic_classes) != tuple(classes):

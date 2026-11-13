@@ -10,13 +10,14 @@ env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 
 custom_imports = dict(imports=['igdet'], allow_failed_imports=False)
 
-data_root = 'data/ScanNet_processed_v2/'
-scannet_ann_root = 'data/scannet_coco_v2_new/'
+data_root = '/data/data/ScanNet_processed_v2/'
+scannet_ann_root = '/data/data/scannet_coco_v2_new/'
 gt_points_dir = f'{data_root}/points'
-vggt_omega_checkpoint = 'data/pretrain/vggt_omega_1b_512.pt'
+vggt_checkpoint = '/data/data/pretrain/VGGT-1B/model.safetensors'
+image_size = (448, 336)  # W,H; every 2D and 3D pipeline uses this canvas
 
 grounding_dino_config = 'configs/gdino/grounding_dino_vggt_pretrain_scannet.py'
-grounding_dino_checkpoint = 'data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
+grounding_dino_checkpoint = '/data/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -27,17 +28,16 @@ _token_dim_ = 512
 _decoder_layer_num = 4
 model = dict(
     type='IGDet',
-    vggt_omega_checkpoint=vggt_omega_checkpoint,
+    vggt_checkpoint=vggt_checkpoint,
+    input_image_size=(336, 448),
     vggt_lora_cfg=dict(
         enabled=True,
         block_indices=[3, 4, 10, 11, 16, 17, 22, 23],
-        branches=['frame_blocks', 'inter_frame_blocks'],
+        branches=['frame_blocks', 'global_blocks'],
         target_modules=['attn.qkv', 'attn.proj'],
         rank=8,
         alpha=16,
-        dropout=0.0,
-        gradient_checkpointing=True,
-        checkpoint_start_block=3),
+        dropout=0.0),
     detection_pyramid_cfg=dict(out_channels=256, norm_groups=32),
     g_dino_cfg=dict(
         cross_view_checkpointing=True,
@@ -47,7 +47,7 @@ model = dict(
     data_preprocessor=dict(
         type='IGDetDataPreprocessor',
         bgr_to_rgb=True,
-        pad_size_divisor=16,
+        pad_size_divisor=14,
         pad_value=0),
     decoder_cfg=dict(  # the same with 3detr
         dec_dim=_token_dim_,
@@ -192,7 +192,7 @@ train_pipeline = [
         n_images=40,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
-            dict(type='Resize', scale=(320, 240), keep_ratio=True, interpolation='bicubic'),
+            dict(type='Resize', scale=image_size, keep_ratio=False, interpolation='bicubic'),
         ],
         loading='random'),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
@@ -205,7 +205,7 @@ test_pipeline = [
         n_images=64,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
-            dict(type='Resize', scale=(320, 240), keep_ratio=True, interpolation='bicubic'),
+            dict(type='Resize', scale=image_size, keep_ratio=False, interpolation='bicubic'),
         ],
         loading='uniform'
     ),
@@ -239,8 +239,8 @@ test_pipeline_2d = [
     dict(type='mmdet.LoadImageFromFile', backend_args=backend_args),
     dict(
         type='mmdet.Resize',
-        scale=(320, 240),
-        keep_ratio=True,
+        scale=image_size,
+        keep_ratio=False,
         interpolation='bicubic'),
     dict(type='mmdet.LoadAnnotations', with_bbox=True),
     dict(
@@ -320,3 +320,5 @@ default_hooks = dict(
 )
 
 find_unused_parameters = True
+
+work_dir = 'work_dirs/vggt_336x448_2d'
