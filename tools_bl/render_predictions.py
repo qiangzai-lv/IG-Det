@@ -38,10 +38,10 @@ def main():
         boxes = original_make_boxes(instances, radius)
         boxes.name = 'Prediction boxes'
         material = boxes.data.materials[0]
-        material.name = 'Prediction blue'
+        material.name = 'Prediction green'
         shader = next(node for node in material.node_tree.nodes if node.bl_idname == 'ShaderNodeBsdfPrincipled')
-        shader.inputs['Base Color'].default_value = (0.0, 0.25, 1.0, 1.0)
-        (shader.inputs.get('Emission Color') or shader.inputs['Emission']).default_value = (0.0, 0.25, 1.0, 1.0)
+        shader.inputs['Base Color'].default_value = (0.0, 1.0, 0.0, 1.0)
+        (shader.inputs.get('Emission Color') or shader.inputs['Emission']).default_value = (0.0, 1.0, 0.0, 1.0)
         return boxes
 
     gt.make_boxes = make_prediction_boxes
