@@ -242,3 +242,22 @@ conda run -n mmcv python -m pytest -q vis/test_visualize_val_predictions.py
 ```
 
 测试涵盖采集透明性、坐标变换、重力中心约定、PLY 几何、空框、阈值与保存数据隔离、JSON 全量条目以及无推理的重新过滤。
+
+### NPU / CUDA / CPU 设备
+
+`--device` 默认 `auto`，优先选择可用 NPU，其次 CUDA，最后 CPU；也可显式指定 `npu:0`、`npu:1`、`cuda:0` 或 `cpu`。NPU 扩展会在模型导入/构建之前注册，并先设置当前设备，避免模型内部初始化落在错误卡上。设备不可用或编号越界会在加载权重前报出清晰错误。`--from-results` 不初始化推理设备。
+
+在 NPU 机器已有的 mmdet 环境运行：
+
+```bash
+python vis/visualize_val_predictions.py \
+  --config work_dirs/igdet_scannet/igdet_scannet.py \
+  --checkpoint work_dirs/igdet_scannet/epoch_1.pth \
+  --device npu:0 \
+  --output-dir vis/outputs/visualization_all \
+  --score-thr 0.01 \
+  --verify-predictions \
+  --overwrite
+```
+
+双前向验证保存并恢复 Python、NumPy、CPU 和所选 NPU/CUDA 设备的随机状态，发生异常也会恢复。NPU 路径不调用 CUDA 随机接口，使用 [torch_npu 官方 get_rng_state / set_rng_state 接口](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/random.py)。NPU 分支通过模拟后端测试；本地没有 NPU 硬件，未完成真实 NPU 前向验证。

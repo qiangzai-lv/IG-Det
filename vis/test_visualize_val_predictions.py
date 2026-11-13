@@ -239,3 +239,87 @@ def test_legacy_results_rerender_does_not_reuse_old_display_counts(tmp_path):
     assert metadata['displayed_boxes'] == 0
     assert 'rendered_detections' not in metadata
     assert len(metadata['predictions']) == 2
+
+
+def test_device_auto_prefers_npu_and_selects_index_without_cuda(monkeypatch):
+    from types import SimpleNamespace
+    chosen = []
+    monkeypatch.setattr(torch,'npu',SimpleNamespace(is_available=lambda:True,
+        current_device=lambda:1,device_count=lambda:2,set_device=chosen.append),raising=False)
+    def no_cuda(*args,**kwargs):
+        raise AssertionError('NPU selection must not call CUDA')
+    monkeypatch.setattr(torch.cuda,'is_available',no_cuda)
+    assert vis.resolve_execution_device('auto') == 'npu:1'
+    assert vis.resolve_execution_device('npu:0') == 'npu:0'
+    assert chosen == [1,0]
+    with pytest.raises(ValueError,match='available device count'):
+        vis.resolve_execution_device('npu:2')
+
+
+def test_device_cuda_and_cpu_fallback_and_invalid_options(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(torch,'npu',SimpleNamespace(is_available=lambda:False),raising=False)
+    monkeypatch.setattr(torch.cuda,'is_available',lambda:True)
+    monkeypatch.setattr(torch.cuda,'current_device',lambda:0)
+    monkeypatch.setattr(torch.cuda,'device_count',lambda:2)
+    chosen=[]
+    monkeypatch.setattr(torch.cuda,'set_device',chosen.append)
+    assert vis.resolve_execution_device('auto') == 'cuda:0'
+    assert vis.resolve_execution_device('cuda:1') == 'cuda:1'
+    assert chosen == [0,1]
+    monkeypatch.setattr(torch.cuda,'is_available',lambda:False)
+    assert vis.resolve_execution_device('auto') == 'cpu'
+    assert vis.resolve_execution_device('cpu') == 'cpu'
+    with pytest.raises(RuntimeError,match='unavailable'):
+        vis.resolve_execution_device('cuda:0')
+    for value in ('cuda:-1','npu:x','auto:0','cpu:0','bad'):
+        with pytest.raises(ValueError):
+            vis.resolve_execution_device(value)
+
+
+def test_missing_npu_extension_has_clear_error(monkeypatch):
+    monkeypatch.delattr(torch,'npu',raising=False)
+    def missing(name):
+        assert name == 'torch_npu'
+        raise ModuleNotFoundError('No module named torch_npu')
+    monkeypatch.setattr(vis.importlib,'import_module',missing)
+    with pytest.raises(RuntimeError,match='torch_npu'):
+        vis.resolve_execution_device('npu:0')
+
+
+def test_npu_rng_restore_on_exception_never_calls_cuda(monkeypatch):
+    import random
+    from types import SimpleNamespace
+    state = dict(value=torch.tensor([1,2],dtype=torch.uint8),indices=[])
+    def get(index):
+        state['indices'].append(('get',index))
+        return state['value']
+    def set_state(value,index):
+        state['indices'].append(('set',index))
+        state['value']=value.clone()
+    monkeypatch.setattr(torch,'npu',SimpleNamespace(get_rng_state=get,set_rng_state=set_state),raising=False)
+    def forbidden(*args,**kwargs):
+        raise AssertionError('CUDA RNG must not be used on NPU')
+    monkeypatch.setattr(torch.cuda,'get_rng_state',forbidden)
+    monkeypatch.setattr(torch.cuda,'set_rng_state',forbidden)
+    cpu, py, npstate = torch.get_rng_state(),random.getstate(),np.random.get_state()
+    with pytest.raises(RuntimeError,match='inside'):
+        with vis.preserve_random_state('npu:1'):
+            torch.rand(3); random.random(); np.random.rand(3)
+            state['value'].fill_(9)
+            raise RuntimeError('inside')
+    assert torch.equal(torch.get_rng_state(),cpu)
+    assert random.getstate() == py
+    np.testing.assert_array_equal(np.random.get_state()[1],npstate[1])
+    assert torch.equal(state['value'],torch.tensor([1,2],dtype=torch.uint8))
+    assert state['indices']==[('get',1),('set',1)]
+
+
+def test_cpu_rng_restore_does_not_touch_accelerators(monkeypatch):
+    def forbidden(*args,**kwargs):
+        raise AssertionError('CPU RNG preservation must not access CUDA')
+    monkeypatch.setattr(torch.cuda,'get_rng_state',forbidden)
+    state=torch.get_rng_state()
+    with vis.preserve_random_state('cpu'):
+        torch.rand(5)
+    assert torch.equal(torch.get_rng_state(),state)

@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib
 import random
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 import json
 from pathlib import Path
 import sys
@@ -27,6 +28,61 @@ EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
          (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
 SIGNS = np.array([[-1,-1,-1], [-1,-1,1], [-1,1,-1], [-1,1,1],
                   [1,-1,-1], [1,-1,1], [1,1,-1], [1,1,1]], np.float32)
+
+
+def resolve_execution_device(requested='auto'):
+    """Register NPU before parsing devices; select its index before model init."""
+    requested = requested.lower()
+    if requested == 'cpu':
+        return 'cpu'
+    kind, separator, ordinal = requested.partition(':')
+    if kind not in ('auto', 'npu', 'cuda') or (kind == 'auto' and separator):
+        raise ValueError('Device must be auto, cpu, npu[:index], or cuda[:index]')
+    if separator and (not ordinal.isdecimal()):
+        raise ValueError('Device index must be a nonnegative integer')
+    # torch_npu registers torch.npu and the NPU device type as an import effect.
+    if kind in ('auto', 'npu') and not hasattr(torch, 'npu'):
+        try:
+            importlib.import_module('torch_npu')
+        except ImportError as error:
+            if kind == 'npu':
+                raise RuntimeError('--device npu requires an importable torch_npu installation') from error
+    npu = getattr(torch, 'npu', None)
+    if kind == 'auto':
+        kind = ('npu' if npu is not None and npu.is_available()
+                else 'cuda' if torch.cuda.is_available() else 'cpu')
+    if kind == 'cpu':
+        return 'cpu'
+    backend = getattr(torch, kind, None)
+    if backend is None or not backend.is_available():
+        raise RuntimeError(f'Requested {kind} is unavailable; check the PyTorch backend or use --device auto')
+    index = int(ordinal) if separator else backend.current_device()
+    if index >= backend.device_count():
+        raise ValueError(f'{kind}:{index} is outside the available device count {backend.device_count()}')
+    backend.set_device(index)
+    return f'{kind}:{index}'
+
+
+@contextmanager
+def preserve_random_state(device):
+    """Restore Python/NumPy/CPU and the selected accelerator, even on errors.
+
+    Do not call CUDA RNG APIs on NPU builds. Both accelerator backends expose
+    get_rng_state(index) / set_rng_state(state, index).
+    """
+    kind, _, ordinal = str(device).partition(':')
+    backend = getattr(torch, kind) if kind != 'cpu' else None
+    index = int(ordinal) if ordinal else (backend.current_device() if backend else None)
+    py_state, np_state, cpu_state = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    accelerator_state = backend.get_rng_state(index).clone() if backend else None
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if backend:
+            backend.set_rng_state(accelerator_state, index)
+        random.setstate(py_state)
+        np.random.set_state(np_state)
 
 
 def numpy(value):
@@ -411,7 +467,8 @@ def parse_args():
     parser.add_argument('--query-topk',type=int)
     parser.add_argument('--max-points',type=int,default=200000)
     parser.add_argument('--line-radius',type=float)
-    parser.add_argument('--device',default='cuda:0')
+    parser.add_argument('--device',default='auto',
+                        help='auto (NPU, CUDA, CPU), npu[:index], cuda[:index], or cpu')
     parser.add_argument('--seed',type=int,default=0)
     parser.add_argument('--verify-predictions',action='store_true',
                         help='Repeat first scene without capture and require exactly equal predictions')
@@ -460,6 +517,8 @@ def main():
         return
     if not Path(args.checkpoint).is_file():
         raise FileNotFoundError(args.checkpoint)
+    args.device = resolve_execution_device(args.device)
+    print(f'Visualization inference device: {args.device}',flush=True)
     from mmengine.config import Config
     from mmengine.runner import Runner, load_checkpoint, set_random_seed
     from mmengine.registry import init_default_scope
@@ -477,6 +536,8 @@ def main():
     # rejects under globally forced deterministic algorithms. Reproducibility
     # is checked directly on real outputs by --verify-predictions instead.
     set_random_seed(args.seed, deterministic=False)
+    if args.device.startswith('npu:'):
+        torch.npu.manual_seed_all(args.seed)
     # Existing optional model visualization draws GT overlays; use this exporter.
     cfg.model.prediction_visualization = False
     if cfg.model.get('train_2d_only',False):
@@ -504,7 +565,7 @@ def main():
     args.output_dir.mkdir(parents=True,exist_ok=True)
     cfg.dump(str(args.output_dir/'resolved_config.py'))
     index = dict(config=str(Path(args.config).resolve()),checkpoint=str(Path(args.checkpoint).resolve()),
-                 seed=args.seed,validation_scene_count=len(available),selected_scenes=selected,completed=[])
+                 seed=args.seed,device=args.device,validation_scene_count=len(available),selected_scenes=selected,completed=[])
     with torch.no_grad():
         for batch in loader:
             scene = str(batch['data_samples'][0].metainfo['scene_id'])
@@ -513,11 +574,8 @@ def main():
             baseline = None
             if args.verify_predictions and not index['completed']:
                 # Preserve RNG state so comparison uses identical stochastic input.
-                py_state, np_state = random.getstate(), np.random.get_state()
-                with torch.random.fork_rng(devices=[torch.device(args.device)] if torch.device(args.device).type == 'cuda' else []):
+                with preserve_random_state(args.device):
                     baseline = model.test_step(copy.deepcopy(batch))
-                random.setstate(py_state)
-                np.random.set_state(np_state)
             with QueryCapture(model) as capture:
                 predictions = model.test_step(batch)
                 if capture.payload is None:
